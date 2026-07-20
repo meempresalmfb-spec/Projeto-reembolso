@@ -1,0 +1,262 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#0e7490">
+<title>Reembolso de Viagem</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🧾</text></svg>">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<!-- ===== Carregando ===== -->
+<div id="telaCarregando" class="tela-centro">
+  <div class="spinner"></div>
+</div>
+
+<!-- ===== Firebase não configurado ===== -->
+<div id="telaConfig" class="tela-centro" hidden>
+  <div class="cartao-login">
+    <h1>🧾 Reembolso de Viagem</h1>
+    <p class="sub">Firebase ainda não configurado</p>
+    <div class="config-aviso">
+      <p>Para o sistema funcionar, abra o arquivo <b>firebase-config.js</b> e cole ali as credenciais do seu projeto Firebase.</p>
+      <p>O passo a passo completo está no arquivo <b>README.md</b> deste projeto.</p>
+    </div>
+  </div>
+</div>
+
+<!-- ===== Login / Cadastro ===== -->
+<div id="telaLogin" class="tela-centro" hidden>
+  <div class="cartao-login">
+    <h1>🧾 Reembolso de Viagem</h1>
+    <p class="sub">Prestação de contas de despesas</p>
+
+    <form id="formLogin">
+      <label>E-mail
+        <input type="email" id="loginEmail" autocomplete="email" required>
+      </label>
+      <label>Senha
+        <input type="password" id="loginSenha" autocomplete="current-password" required>
+      </label>
+      <button type="submit" class="btn primario grande">Entrar</button>
+      <div class="links-login">
+        <a href="#" id="linkEsqueci">Esqueci a senha</a>
+        <a href="#" id="linkCriarConta">Criar conta</a>
+      </div>
+    </form>
+
+    <form id="formCadastro" hidden>
+      <label>Nome completo
+        <input type="text" id="cadNome" autocomplete="name" required>
+      </label>
+      <label>E-mail
+        <input type="email" id="cadEmail" autocomplete="email" required>
+      </label>
+      <label>Senha <span class="mini">(mínimo 6 caracteres)</span>
+        <input type="password" id="cadSenha" autocomplete="new-password" minlength="6" required>
+      </label>
+      <button type="submit" class="btn primario grande">Criar conta</button>
+      <div class="links-login">
+        <a href="#" id="linkVoltarLogin">← Já tenho conta</a>
+      </div>
+      <p class="mini centro">Só e-mails liberados por um moderador conseguem criar conta.</p>
+    </form>
+
+    <p id="loginErro" class="erro" hidden></p>
+  </div>
+</div>
+
+<!-- ===== Acesso bloqueado ===== -->
+<div id="telaBloqueado" class="tela-centro" hidden>
+  <div class="cartao-login">
+    <h1>🔒 Acesso não liberado</h1>
+    <p class="sub">Seu e-mail ainda não foi liberado no sistema.</p>
+    <p class="centro">Peça para um moderador liberar seu e-mail na aba <b>Equipe</b> e tente de novo.</p>
+    <button class="btn grande" id="btnSairBloqueado">Sair</button>
+  </div>
+</div>
+
+<!-- ===== App ===== -->
+<div id="app" hidden>
+  <header class="topo">
+    <div class="topo-conteudo">
+      <span class="logo">🧾 Reembolso</span>
+      <div class="topo-user">
+        <span id="topoNome"></span>
+        <button class="btn mini-btn" id="btnSair">Sair</button>
+      </div>
+    </div>
+    <nav class="abas" id="navAbas">
+      <button class="aba" data-aba="regras">📋 Regras</button>
+      <button class="aba" data-aba="nova">➕ Nova</button>
+      <button class="aba" data-aba="minhas">🧾 Minhas</button>
+      <button class="aba so-mod" data-aba="painel" hidden>✅ Painel <span id="badgePendentes" class="badge" hidden></span></button>
+      <button class="aba so-mod" data-aba="equipe" hidden>👥 Equipe</button>
+    </nav>
+  </header>
+
+  <main>
+    <!-- ===== Regras ===== -->
+    <section id="secRegras" class="secao" hidden>
+      <div class="secao-titulo">
+        <h2>Regras de Reembolso</h2>
+        <button class="btn so-mod" id="btnEditarRegras" hidden>✏️ Editar</button>
+      </div>
+      <div id="regrasView" class="cartao regras-texto"></div>
+      <p id="regrasRodape" class="mini" hidden></p>
+
+      <div id="regrasEditor" hidden>
+        <div class="cartao">
+          <label>Texto das regras <span class="mini">(use ## para título, - para lista, **negrito**)</span>
+            <textarea id="regrasTexto" rows="18"></textarea>
+          </label>
+          <h3>Parâmetros automáticos</h3>
+          <div class="linha-2">
+            <label>Limite de alimentação por dia (R$)
+              <input type="text" id="paramLimiteDia" inputmode="decimal">
+            </label>
+            <label>Valor por km (R$)
+              <input type="text" id="paramTaxaKm" inputmode="decimal">
+            </label>
+          </div>
+          <div class="linha-botoes">
+            <button class="btn" id="btnCancelarRegras">Cancelar</button>
+            <button class="btn" id="btnRestaurarRegras">Restaurar padrão</button>
+            <button class="btn primario" id="btnSalvarRegras">Salvar</button>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ===== Nova Solicitação ===== -->
+    <section id="secNova" class="secao" hidden>
+      <h2>Nova Solicitação</h2>
+      <form id="formNova" class="cartao" novalidate>
+        <label>Data da despesa
+          <input type="date" id="nvData" required>
+        </label>
+
+        <label>Categoria
+          <select id="nvCategoria" required>
+            <option value="">Selecione…</option>
+            <option>Alimentação</option>
+            <option>Uber</option>
+            <option>Combustível</option>
+            <option>Hospedagem</option>
+            <option>Outros</option>
+          </select>
+        </label>
+        <p id="nvHint" class="hint" hidden></p>
+
+        <div id="blocoSubtipo" hidden>
+          <span class="rotulo">Categoria do Uber</span>
+          <div class="radios">
+            <label class="radio"><input type="radio" name="nvSubtipo" value="Uber X" checked> Uber X</label>
+            <label class="radio"><input type="radio" name="nvSubtipo" value="Uber Comfort"> Uber Comfort</label>
+          </div>
+        </div>
+
+        <div id="blocoKm" hidden>
+          <label>Quilômetros rodados
+            <input type="text" id="nvKm" inputmode="decimal" placeholder="ex.: 15,7">
+          </label>
+          <p class="hint" id="hintKm"></p>
+        </div>
+
+        <label>Valor (R$)
+          <input type="text" id="nvValor" inputmode="decimal" placeholder="ex.: 60,00" required>
+        </label>
+
+        <div id="alimBox" class="aviso" hidden></div>
+
+        <div id="blocoJustificativa" hidden>
+          <label>Justificativa <b class="obrig">(obrigatória para Uber Comfort)</b>
+            <textarea id="nvJustificativa" rows="2" placeholder="Ex.: sem carros no Uber X, reunião com horário rígido…"></textarea>
+          </label>
+        </div>
+
+        <label>Descrição <span class="mini">(opcional)</span>
+          <input type="text" id="nvDescricao" placeholder="ex.: almoço no evento de sábado">
+        </label>
+
+        <span class="rotulo">Comprovante <b class="obrig">(obrigatório — cupom fiscal)</b></span>
+        <label class="upload" id="areaUpload">
+          <input type="file" id="nvArquivo" accept="image/*,application/pdf" hidden>
+          <span id="uploadTexto">📎 Tirar foto ou anexar arquivo</span>
+        </label>
+        <div id="uploadPreview" class="preview" hidden></div>
+
+        <button type="submit" class="btn primario grande" id="btnEnviar">Enviar solicitação</button>
+      </form>
+    </section>
+
+    <!-- ===== Minhas Solicitações ===== -->
+    <section id="secMinhas" class="secao" hidden>
+      <h2>Minhas Solicitações</h2>
+      <div id="listaMinhas"></div>
+    </section>
+
+    <!-- ===== Painel do Moderador ===== -->
+    <section id="secPainel" class="secao" hidden>
+      <h2>Painel do Moderador</h2>
+      <div class="cartao filtros">
+        <div class="linha-2">
+          <label>Status
+            <select id="fltStatus">
+              <option value="pendente">Pendentes</option>
+              <option value="aprovada">Aprovadas</option>
+              <option value="negada">Negadas</option>
+              <option value="todas">Todas</option>
+            </select>
+          </label>
+          <label>Funcionário
+            <select id="fltFuncionario"><option value="">Todos</option></select>
+          </label>
+        </div>
+        <div class="linha-2">
+          <label>De <input type="date" id="fltDe"></label>
+          <label>Até <input type="date" id="fltAte"></label>
+        </div>
+      </div>
+      <div id="listaPainel"></div>
+
+      <h3 class="tot-titulo">💰 Totalizador por funcionário</h3>
+      <p class="mini">Considera os filtros de funcionário e período acima (todos os status). Somas de aprovadas usam o valor aprovado.</p>
+      <div id="totalizador" class="cartao tabela-wrap"></div>
+    </section>
+
+    <!-- ===== Equipe (moderador) ===== -->
+    <section id="secEquipe" class="secao" hidden>
+      <h2>Equipe e Acesso</h2>
+
+      <div class="cartao">
+        <h3>E-mails liberados para criar conta</h3>
+        <form id="formAddEmail" class="linha-add">
+          <input type="email" id="addEmail" placeholder="email@exemplo.com" required>
+          <button type="submit" class="btn primario">Liberar</button>
+        </form>
+        <div id="listaEmails" class="chips"></div>
+      </div>
+
+      <div class="cartao">
+        <h3>Usuários cadastrados</h3>
+        <div id="listaUsuarios"></div>
+        <p class="mini">Para remover totalmente um usuário, apague também a conta dele em Firebase Console → Authentication.</p>
+      </div>
+    </section>
+  </main>
+</div>
+
+<div id="modalRoot"></div>
+<div id="toastRoot"></div>
+
+<!-- Firebase (compat — funciona em qualquer hospedagem estática) -->
+<script src="https://www.gstatic.com/firebasejs/11.0.2/firebase-app-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/11.0.2/firebase-auth-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/11.0.2/firebase-firestore-compat.js"></script>
+<script src="firebase-config.js"></script>
+<script src="app.js"></script>
+</body>
+</html>

@@ -1,0 +1,131 @@
+rules_version = '2';
+
+// ============================================================
+// REGRAS DE SEGURANÇA — Reembolso de Viagem
+// Cole este arquivo inteiro em:
+// Firebase Console → Firestore Database → Regras → Publicar
+//
+// Garantias impostas PELO SERVIDOR (não só pela interface):
+// - Funcionário só lê as PRÓPRIAS solicitações e comprovantes.
+// - Moderador (papel no doc usuarios/) lê tudo e é o único que
+//   aprova/nega; negar EXIGE observação não vazia.
+// - Só e-mails na lista config/acesso conseguem criar conta.
+// - Ninguém se autopromove a moderador.
+// - Solicitação nasce sempre 'pendente' e sempre em par com o
+//   comprovante (verificação atômica via existsAfter).
+// ============================================================
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function logado() {
+      return request.auth != null;
+    }
+
+    function ehModerador() {
+      return logado()
+        && exists(/databases/$(database)/documents/usuarios/$(request.auth.uid))
+        && get(/databases/$(database)/documents/usuarios/$(request.auth.uid)).data.papel == 'moderador';
+    }
+
+    function emailPermitido() {
+      return request.auth.token.email in
+        get(/databases/$(database)/documents/config/acesso).data.emails;
+    }
+
+    // ---------- Usuários ----------
+    match /usuarios/{uid} {
+      // Cada um lê o próprio perfil; moderador lê (e lista) todos
+      allow read: if logado() && (request.auth.uid == uid || ehModerador());
+
+      // Criação: só o próprio, só com e-mail liberado, sempre como funcionário
+      allow create: if logado()
+        && request.auth.uid == uid
+        && request.resource.data.keys().hasOnly(['nome', 'email', 'papel', 'criadoEm'])
+        && request.resource.data.papel == 'funcionario'
+        && request.resource.data.email == request.auth.token.email
+        && request.resource.data.nome is string
+        && request.resource.data.nome.size() > 0
+        && emailPermitido();
+
+      // Moderador muda papel/nome; o próprio usuário só muda o nome
+      allow update: if
+        (ehModerador()
+          && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['papel', 'nome'])
+          && request.resource.data.papel in ['funcionario', 'moderador'])
+        || (logado() && request.auth.uid == uid
+          && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['nome']));
+
+      allow delete: if ehModerador();
+    }
+
+    // ---------- Configurações (regras dinâmicas, parâmetros, acesso) ----------
+    match /config/{docId} {
+      allow read: if logado();
+      allow write: if ehModerador();
+    }
+
+    // ---------- Solicitações ----------
+    match /solicitacoes/{id} {
+      // Dono lê as próprias; moderador lê todas
+      allow read: if logado()
+        && (resource.data.uid == request.auth.uid || ehModerador());
+
+      // Criação pelo próprio funcionário: nasce pendente, com valor válido,
+      // justificativa obrigatória se Uber Comfort e comprovante no mesmo lote
+      allow create: if logado()
+        && request.resource.data.uid == request.auth.uid
+        && request.resource.data.status == 'pendente'
+        && request.resource.data.valor is number
+        && request.resource.data.valor > 0
+        && request.resource.data.categoria in ['Alimentação', 'Uber', 'Combustível', 'Hospedagem', 'Outros']
+        && request.resource.data.dataDespesa is string
+        && request.resource.data.dataDespesa.size() == 10
+        && (
+          request.resource.data.get('subtipo', '') != 'Uber Comfort'
+          || (request.resource.data.justificativa is string
+              && request.resource.data.justificativa.size() > 0)
+        )
+        && existsAfter(/databases/$(database)/documents/comprovantes/$(id));
+
+      // Moderação: só moderador, só em pendente, só os campos de moderação;
+      // negar exige observação preenchida
+      allow update: if ehModerador()
+        && resource.data.status == 'pendente'
+        && request.resource.data.diff(resource.data).affectedKeys()
+             .hasOnly(['status', 'observacao', 'valorAprovado', 'moderadoPor', 'moderadoEm'])
+        && (
+          (request.resource.data.status == 'aprovada'
+            && request.resource.data.valorAprovado is number
+            && request.resource.data.valorAprovado >= 0
+            && request.resource.data.valorAprovado <= resource.data.valor)
+          ||
+          (request.resource.data.status == 'negada'
+            && request.resource.data.observacao is string
+            && request.resource.data.observacao.size() > 0)
+        );
+
+      // Dono pode excluir enquanto pendente (junto com o comprovante, no mesmo lote)
+      allow delete: if logado()
+        && resource.data.uid == request.auth.uid
+        && resource.data.status == 'pendente'
+        && !existsAfter(/databases/$(database)/documents/comprovantes/$(id));
+    }
+
+    // ---------- Comprovantes (arquivo em base64, doc separado) ----------
+    match /comprovantes/{id} {
+      allow read: if logado()
+        && (resource.data.uid == request.auth.uid || ehModerador());
+
+      // Só nasce junto com a solicitação de mesmo id (mesmo lote)
+      allow create: if logado()
+        && request.resource.data.uid == request.auth.uid
+        && existsAfter(/databases/$(database)/documents/solicitacoes/$(id));
+
+      // Só morre junto com a solicitação (mesmo lote)
+      allow delete: if logado()
+        && resource.data.uid == request.auth.uid
+        && !existsAfter(/databases/$(database)/documents/solicitacoes/$(id));
+    }
+  }
+}
