@@ -8,10 +8,10 @@
 // ============================================================
 
 window.FIREBASE_CONFIG = {
-  apiKey: "COLE_AQUI_SUA_API_KEY",
-  authDomain: "COLE_AQUI.firebaseapp.com",
-  projectId: "COLE_AQUI_SEU_PROJECT_ID",
-  storageBucket: "COLE_AQUI.appspot.com",
-  messagingSenderId: "COLE_AQUI",
-  appId: "COLE_AQUI"
+  apiKey: "AIzaSyAMMASvRSQDJo1TS3VYb8XO95Qt0Bp5gcE",
+  authDomain: "reembolso-ceo.firebaseapp.com",
+  projectId: "reembolso-ceo",
+  storageBucket: "reembolso-ceo.firebasestorage.app",
+  messagingSenderId: "587083492775",
+  appId: "1:587083492775:web:c493a969abe5f9be511a82"
 };
