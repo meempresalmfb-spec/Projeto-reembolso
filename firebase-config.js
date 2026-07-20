@@ -1,7 +1,7 @@
 // ============================================================
 // CONFIGURAÇÃO DO FIREBASE
 // Cole aqui as credenciais do SEU projeto Firebase.
-// Passo a passo completo no README.md (seção 2, item 6).
+// Passo a passo completo no README.md (seção 2, item 5).
 //
 // No console do Firebase: Configurações do projeto (engrenagem)
 // → Geral → Seus apps → SDK setup and configuration → Config

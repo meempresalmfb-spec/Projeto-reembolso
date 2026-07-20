@@ -61,7 +61,6 @@
       <div class="links-login">
         <a href="#" id="linkVoltarLogin">← Já tenho conta</a>
       </div>
-      <p class="mini centro">Só e-mails liberados por um moderador conseguem criar conta.</p>
     </form>
 
     <p id="loginErro" class="erro" hidden></p>
@@ -71,9 +70,9 @@
 <!-- ===== Acesso bloqueado ===== -->
 <div id="telaBloqueado" class="tela-centro" hidden>
   <div class="cartao-login">
-    <h1>🔒 Acesso não liberado</h1>
-    <p class="sub">Seu e-mail ainda não foi liberado no sistema.</p>
-    <p class="centro">Peça para um moderador liberar seu e-mail na aba <b>Equipe</b> e tente de novo.</p>
+    <h1>🔒 Perfil não ativado</h1>
+    <p class="sub">Não consegui ativar seu perfil no sistema.</p>
+    <p class="centro">Saia e entre de novo. Se continuar, fale com um moderador.</p>
     <button class="btn grande" id="btnSairBloqueado">Sair</button>
   </div>
 </div>
@@ -229,21 +228,13 @@
 
     <!-- ===== Equipe (moderador) ===== -->
     <section id="secEquipe" class="secao" hidden>
-      <h2>Equipe e Acesso</h2>
-
-      <div class="cartao">
-        <h3>E-mails liberados para criar conta</h3>
-        <form id="formAddEmail" class="linha-add">
-          <input type="email" id="addEmail" placeholder="email@exemplo.com" required>
-          <button type="submit" class="btn primario">Liberar</button>
-        </form>
-        <div id="listaEmails" class="chips"></div>
-      </div>
+      <h2>Equipe</h2>
 
       <div class="cartao">
         <h3>Usuários cadastrados</h3>
+        <p class="mini">Qualquer pessoa com o link pode criar conta (sempre como funcionário). Aqui você promove ou rebaixa moderadores.</p>
         <div id="listaUsuarios"></div>
-        <p class="mini">Para remover totalmente um usuário, apague também a conta dele em Firebase Console → Authentication.</p>
+        <p class="mini">Para banir alguém, apague a conta em Firebase Console → Authentication.</p>
       </div>
     </section>
   </main>

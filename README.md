@@ -11,7 +11,9 @@ Sistema web de prestação de contas de despesas de viagem para equipes de até 
 | Perfil | Pode |
 |---|---|
 | **Funcionário** | Criar solicitações com comprovante, acompanhar status, ver o motivo quando negada. Vê **só as próprias** solicitações (garantido pelas regras do Firestore no servidor, não só pela interface). |
-| **Moderador** | Ver tudo, aprovar/negar (negar **exige** observação), editar a aba Regras, filtrar por funcionário/status/período, ver o totalizador por funcionário e gerenciar quem pode criar conta (aba Equipe). |
+| **Moderador** | Ver tudo, aprovar/negar (negar **exige** observação), editar a aba Regras, filtrar por funcionário/status/período, ver o totalizador por funcionário e promover/rebaixar moderadores (aba Equipe). |
+
+> **Cadastro aberto (decisão de projeto):** qualquer pessoa com o link cria a própria conta — sem lista de e-mails pra gerenciar. Toda conta nasce como funcionário e só vê o próprio conteúdo; moderador só existe por promoção. Se aparecer conta estranha na fila, é só negar e banir em Authentication.
 
 Validações automáticas:
 - Alimentação: alerta quando a soma do dia passa de R$ 120,00 e mostra o desconto que será aplicado (ex.: gastou R$ 126 → recebe R$ 120). O valor com desconto já vem sugerido para o moderador na aprovação.
@@ -51,15 +53,7 @@ README.md          ← este guia
    Ainda no Firestore, aba **Regras**: apague o que estiver lá, cole **todo o conteúdo do arquivo `firestore.rules`** e clique em **Publicar**.
    > São essas regras que garantem no servidor que funcionário só vê o que é dele, que só moderador aprova/nega e que negar exige observação.
 
-5. **Liberar o primeiro e-mail (o seu, de moderador):**
-   Na aba **Dados** do Firestore → **Iniciar coleção**:
-   - ID da coleção: `config`
-   - ID do documento: `acesso`
-   - Campo: `emails` · tipo **array** · adicione uma string com **seu e-mail** (minúsculas)
-   - Salvar.
-   > Só e-mails dessa lista conseguem criar conta. Depois desse bootstrap, você adiciona os demais pela aba **Equipe** do próprio sistema.
-
-6. **Pegar as credenciais do app web:**
+5. **Pegar as credenciais do app web:**
    Engrenagem ⚙️ → **Configurações do projeto → Geral → Seus apps →** ícone **`</>`** (Web). Dê um apelido (ex.: `site`), **não** precisa marcar Hosting, clique em **Registrar app**.
    Vai aparecer um bloco `const firebaseConfig = { ... }`. Copie **só o objeto** (de `{` a `}`) e cole no arquivo **`firebase-config.js`**, substituindo o objeto de exemplo. Fica assim:
 
@@ -81,7 +75,7 @@ README.md          ← este guia
 1. Crie uma conta em [github.com](https://github.com) (se não tiver).
 2. **Novo repositório**: nome ex.: `reembolso`, visibilidade **Public** (necessário para o Pages gratuito), sem README.
 3. Envie os arquivos do projeto. O jeito mais simples sem linha de comando: dentro do repositório, **Add file → Upload files**, arraste `index.html`, `style.css`, `app.js` e `firebase-config.js` (já editado) e clique em **Commit changes**.
-   > A `apiKey` do Firebase **pode** ficar pública — ela só identifica o projeto; a segurança vem das regras do Firestore e da lista de e-mails liberados.
+   > A `apiKey` do Firebase **pode** ficar pública — ela só identifica o projeto; a segurança vem das regras do Firestore.
 4. No repositório: **Settings → Pages → Build and deployment → Source: Deploy from a branch → Branch: `main` / `(root)` → Save**.
 5. Em 1-2 minutos o site fica no ar em:
    `https://SEU-USUARIO.github.io/reembolso/`
@@ -94,14 +88,14 @@ README.md          ← este guia
 
 ## 4. Primeiro acesso (bootstrap do moderador)
 
-1. Abra o site publicado → **Criar conta** → use o e-mail que você liberou no passo 2.5.
+1. Abra o site publicado → **Criar conta**.
 2. Sua conta nasce como *funcionário*. Para virar moderador:
    Firebase Console → **Firestore → Dados → coleção `usuarios`** → abra o seu documento → edite o campo `papel` de `funcionario` para **`moderador`** → salvar.
 3. Recarregue o site. Agora você tem as abas **Painel** e **Equipe**.
-4. Na aba **Equipe**, libere os e-mails do resto do time (e promova os outros 1-2 moderadores direto ali, sem console).
+4. Os outros 1-2 moderadores criam conta normalmente e você promove eles na aba **Equipe**, sem console.
 5. Cada funcionário acessa o link, cria a própria conta e já pode enviar solicitações.
 
-> Passos 2 e 3 do console só acontecem **uma vez**, para o primeiro moderador. Todo o resto da gestão é pelo próprio sistema.
+> O passo 2 do console só acontece **uma vez**, para o primeiro moderador. Todo o resto da gestão é pelo próprio sistema.
 
 ## 5. Rotina de uso
 
@@ -124,7 +118,6 @@ Dica de manutenção: uma vez por ano, exporte/anote o histórico antigo e exclu
 | Sintoma | Causa provável |
 |---|---|
 | Tela "Firebase ainda não configurado" | `firebase-config.js` ainda com os valores `COLE_AQUI...` |
-| "Seu e-mail ainda não foi liberado" | E-mail fora da lista `config/acesso` (aba Equipe, ou passo 2.5 no primeiro acesso) |
 | Login não funciona no site publicado, mas o site abre | Faltou adicionar `SEU-USUARIO.github.io` nos Domínios autorizados (passo 3.6) |
 | "Sem permissão para essa ação" | Regras do Firestore não publicadas (passo 2.4) ou usuário sem papel de moderador tentando moderar |
 | Site não abre após publicar | Aguarde 1-2 min; confira se o arquivo se chama exatamente `index.html` e está na raiz do repositório |

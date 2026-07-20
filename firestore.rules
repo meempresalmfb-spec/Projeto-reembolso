@@ -9,7 +9,8 @@ rules_version = '2';
 // - Funcionário só lê as PRÓPRIAS solicitações e comprovantes.
 // - Moderador (papel no doc usuarios/) lê tudo e é o único que
 //   aprova/nega; negar EXIGE observação não vazia.
-// - Só e-mails na lista config/acesso conseguem criar conta.
+// - Cadastro aberto: qualquer um com o link cria conta, mas SEMPRE
+//   como funcionário — moderador só via promoção.
 // - Ninguém se autopromove a moderador.
 // - Solicitação nasce sempre 'pendente' e sempre em par com o
 //   comprovante (verificação atômica via existsAfter).
@@ -28,25 +29,19 @@ service cloud.firestore {
         && get(/databases/$(database)/documents/usuarios/$(request.auth.uid)).data.papel == 'moderador';
     }
 
-    function emailPermitido() {
-      return request.auth.token.email in
-        get(/databases/$(database)/documents/config/acesso).data.emails;
-    }
-
     // ---------- Usuários ----------
     match /usuarios/{uid} {
       // Cada um lê o próprio perfil; moderador lê (e lista) todos
       allow read: if logado() && (request.auth.uid == uid || ehModerador());
 
-      // Criação: só o próprio, só com e-mail liberado, sempre como funcionário
+      // Criação: só o próprio, sempre como funcionário
       allow create: if logado()
         && request.auth.uid == uid
         && request.resource.data.keys().hasOnly(['nome', 'email', 'papel', 'criadoEm'])
         && request.resource.data.papel == 'funcionario'
         && request.resource.data.email == request.auth.token.email
         && request.resource.data.nome is string
-        && request.resource.data.nome.size() > 0
-        && emailPermitido();
+        && request.resource.data.nome.size() > 0;
 
       // Moderador muda papel/nome; o próprio usuário só muda o nome
       allow update: if
@@ -59,7 +54,7 @@ service cloud.firestore {
       allow delete: if ehModerador();
     }
 
-    // ---------- Configurações (regras dinâmicas, parâmetros, acesso) ----------
+    // ---------- Configurações (regras dinâmicas e parâmetros) ----------
     match /config/{docId} {
       allow read: if logado();
       allow write: if ehModerador();

@@ -71,7 +71,6 @@
   let minhas = [];
   let todas = [];
   let usuarios = [];
-  let emailsAcesso = [];
   let comprovante = null;        // { dados, mime, nome }
   let unsubs = [];
   let cadastroEmAndamento = false;
@@ -144,7 +143,7 @@
       'auth/too-many-requests': 'Muitas tentativas. Aguarde alguns minutos.',
       'auth/network-request-failed': 'Falha de conexão. Verifique a internet.',
       'permission-denied': 'Sem permissão para essa ação.',
-      'app/email-nao-liberado': 'Seu e-mail ainda não foi liberado. Peça a um moderador para liberar na aba Equipe.'
+      'app/perfil-falhou': 'Sua conta foi criada, mas o perfil não ativou. Use "Entrar" com o mesmo e-mail e senha.'
     };
     return mapa[code] || (e && e.message) || 'Erro inesperado. Tente de novo.';
   }
@@ -225,9 +224,8 @@
           nome: nome, email: email, papel: 'funcionario', criadoEm: FV.serverTimestamp()
         });
       } catch (errDoc) {
-        // e-mail não liberado na lista de acesso → desfaz a conta
-        try { await cred.user.delete(); } catch (_) { await auth.signOut(); }
-        throw { code: 'app/email-nao-liberado' };
+        // falha inesperada ao criar o perfil — o login completa depois
+        throw { code: 'app/perfil-falhou' };
       }
       cadastroEmAndamento = false;
       await tratarAuth(cred.user);
@@ -256,7 +254,7 @@
     usuarioAtual = user;
     perfil = null;
     if (!user) {
-      minhas = []; todas = []; usuarios = []; emailsAcesso = [];
+      minhas = []; todas = []; usuarios = [];
       mostrarTela('telaLogin');
       return;
     }
@@ -310,7 +308,7 @@
       .onSnapshot((s) => { minhas = docsToArr(s); renderMinhas(); },
         (e) => toast(msgErroFirebase(e), 'erro')));
 
-    // Moderador: tudo + usuários + lista de acesso
+    // Moderador: tudo + usuários
     if (ehMod()) {
       unsubs.push(db.collection('solicitacoes').onSnapshot((s) => {
         todas = docsToArr(s); renderPainel();
@@ -318,10 +316,6 @@
       unsubs.push(db.collection('usuarios').onSnapshot((s) => {
         usuarios = docsToArr(s).sort((a, b) => (a.nome || '').localeCompare(b.nome || '', 'pt-BR'));
         preencherFiltroFuncionarios(); renderPainel(); renderEquipe();
-      }, () => {}));
-      unsubs.push(db.collection('config').doc('acesso').onSnapshot((s) => {
-        emailsAcesso = (s.exists && s.data().emails) || [];
-        renderEquipe();
       }, () => {}));
     }
   }
@@ -999,26 +993,8 @@
   // ============================================================
   // EQUIPE (moderador)
   // ============================================================
-  $('#formAddEmail').addEventListener('submit', async (e) => {
-    e.preventDefault();
-    const email = $('#addEmail').value.trim().toLowerCase();
-    if (!email) return;
-    try {
-      await db.collection('config').doc('acesso')
-        .set({ emails: FV.arrayUnion(email) }, { merge: true });
-      $('#addEmail').value = '';
-      toast('E-mail liberado: ' + email, 'ok');
-    } catch (e2) { toast(msgErroFirebase(e2), 'erro'); }
-  });
-
   function renderEquipe() {
     if (!ehMod()) return;
-    $('#listaEmails').innerHTML = !emailsAcesso.length
-      ? '<span class="mini">Nenhum e-mail liberado ainda.</span>'
-      : emailsAcesso.slice().sort().map((em) =>
-        '<span class="chip-email">' + esc(em) +
-        '<button title="Remover" data-email="' + esc(em) + '">✕</button></span>').join('');
-
     $('#listaUsuarios').innerHTML = !usuarios.length
       ? '<span class="mini">Nenhum usuário ainda.</span>'
       : usuarios.map((u) =>
@@ -1031,32 +1007,6 @@
         '<option value="moderador"' + (u.papel === 'moderador' ? ' selected' : '') + '>Moderador</option>' +
         '</select></div>').join('');
   }
-
-  $('#listaEmails').addEventListener('click', (e) => {
-    const btn = e.target.closest('button[data-email]');
-    if (!btn) return;
-    const email = btn.dataset.email;
-    if (email === perfil.email) { toast('Você não pode remover o próprio e-mail.', 'erro'); return; }
-    const usuario = usuarios.find((u) => u.email === email);
-    abrirModal(
-      '<h3>Remover acesso?</h3>' +
-      '<p><b>' + esc(email) + '</b> não poderá mais criar conta' +
-      (usuario ? ' e o perfil de <b>' + esc(usuario.nome) + '</b> será desativado' : '') + '.</p>' +
-      '<div class="linha-botoes">' +
-      '<button class="btn" id="mdCancelar">Cancelar</button>' +
-      '<button class="btn perigo" id="mdConfirmar">Remover</button></div>');
-    $('#mdCancelar').addEventListener('click', fecharModal);
-    $('#mdConfirmar').addEventListener('click', async () => {
-      try {
-        const batch = db.batch();
-        batch.update(db.collection('config').doc('acesso'), { emails: FV.arrayRemove(email) });
-        if (usuario) batch.delete(db.collection('usuarios').doc(usuario.id));
-        await batch.commit();
-        toast('Acesso removido.', 'ok');
-      } catch (e2) { toast(msgErroFirebase(e2), 'erro'); }
-      fecharModal();
-    });
-  });
 
   $('#listaUsuarios').addEventListener('change', async (e) => {
     const sel = e.target.closest('select[data-uid]');
