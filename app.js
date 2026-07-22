@@ -3,6 +3,9 @@
    Front-end estático (GitHub Pages) + Firebase Auth/Firestore.
    Comprovantes: imagem comprimida no navegador e salva em base64
    na coleção `comprovantes` (o plano gratuito não inclui Storage).
+   Uma solicitação pode ter várias despesas do mesmo dia (lote):
+   cada despesa é um doc próprio ligado pelo campo `loteId`, e o
+   moderador aprova/nega cada uma individualmente.
    ============================================================ */
 'use strict';
 
@@ -26,6 +29,7 @@
   const PARAMS_PADRAO = { limiteDiaAlimentacao: 120, taxaKm: 0.93 };
   const MAX_CHARS_IMG = 850000;      // ~640 KB de arquivo → cabe no doc de 1 MB
   const MAX_BYTES_PDF = 680 * 1024;
+  const MAX_ITENS = 10;              // despesas por solicitação (limite do batch)
 
   const REGRAS_PADRAO = `## 1. Alimentação
 - Valor máximo de **R$ 60,00 por refeição**.
@@ -55,8 +59,10 @@
 - Uber e iFood: print com o endereço do deslocamento e o pedido com valor final.
 
 ## 5. Prestação de Contas
-- Lance cada despesa aqui no sistema, na aba **Nova**, com o comprovante anexado.
-- A solicitação fica **Pendente** até um moderador aprovar ou negar (negativas vêm com o motivo).
+- Lance as despesas aqui no sistema, na aba **Nova** — dá para adicionar várias despesas do mesmo dia numa única solicitação (ex.: café, almoço e jantar), cada uma com o próprio comprovante.
+- A **descrição é obrigatória** em cada despesa (ex.: "almoço no evento de sábado").
+- Cada despesa é avaliada individualmente: pode ser aprovada, aprovada parcialmente ou negada (negativas e aprovações parciais vêm com o motivo).
+- Mantenha sua **chave PIX** cadastrada — é por ela que os reembolsos são pagos.
 
 ## 6. Datas de Pagamento
 - Os pagamentos seguem ciclos de **7 dias úteis** após a solicitação.
@@ -64,18 +70,22 @@
 
   // ---------- Estado ----------
   let usuarioAtual = null;
-  let perfil = null;             // { uid, nome, email, papel }
+  let perfil = null;             // { uid, nome, email, papel, pix }
   let params = Object.assign({}, PARAMS_PADRAO);
   let regrasTexto = REGRAS_PADRAO;
   let regrasMeta = null;
   let minhas = [];
   let todas = [];
   let usuarios = [];
-  let comprovante = null;        // { dados, mime, nome }
+  let itens = [novoItem()];      // despesas da nova solicitação
   let unsubs = [];
   let cadastroEmAndamento = false;
   let urlModalAtual = null;
   let abaAtual = null;
+
+  function novoItem() {
+    return { categoria: '', subtipo: 'Uber X', km: '', valor: '', justificativa: '', descricao: '', comprovante: null };
+  }
 
   // ---------- Atalhos ----------
   const $ = (sel) => document.querySelector(sel);
@@ -118,8 +128,16 @@
     toastRoot.appendChild(d);
     setTimeout(() => d.remove(), 4500);
   }
-  const rotuloStatus = (s) =>
-    s === 'pendente' ? 'Pendente' : s === 'aprovada' ? 'Aprovada' : 'Negada';
+  const ehParcial = (s) => s.status === 'aprovada' &&
+    typeof s.valorAprovado === 'number' && s.valorAprovado < s.valor - 0.004;
+  function rotuloDe(s) {
+    if (s.status === 'pendente') return 'Pendente';
+    if (s.status === 'negada') return 'Negada';
+    return ehParcial(s) ? 'Aprovada parcial' : 'Aprovada';
+  }
+  const chipDe = (s) =>
+    '<span class="chip chip-' + (ehParcial(s) ? 'parcial' : s.status) + '">' + rotuloDe(s) + '</span>';
+  const sugeridoDe = (s) => typeof s.valorSugerido === 'number' ? s.valorSugerido : s.valor;
   const docsToArr = (snap) =>
     snap.docs.map((d) => Object.assign({ id: d.id }, d.data({ serverTimestamps: 'estimate' })));
   const ordCriado = (a, b) =>
@@ -130,6 +148,35 @@
   function nomeDe(sol) {
     const u = usuarios.find((x) => x.id === sol.uid);
     return (u && u.nome) || sol.nome || '—';
+  }
+  function pixDe(uid) {
+    const u = usuarios.find((x) => x.id === uid);
+    return (u && u.pix) || '';
+  }
+  // Agrupa solicitações enviadas juntas (mesmo loteId); doc antigo sem lote fica sozinho
+  function agruparPorLote(arr) {
+    const grupos = {};
+    const ordem = [];
+    arr.forEach((s) => {
+      const k = s.loteId || s.id;
+      if (!grupos[k]) { grupos[k] = []; ordem.push(k); }
+      grupos[k].push(s);
+    });
+    return ordem.map((k) => grupos[k]);
+  }
+  function copiarTexto(txt) {
+    const ok = () => toast('Copiado: ' + txt, 'ok');
+    const falha = () => toast('Não consegui copiar — selecione e copie manualmente.', 'erro');
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(txt).then(ok, falha);
+    } else {
+      const ta = document.createElement('textarea');
+      ta.value = txt;
+      document.body.appendChild(ta);
+      ta.select();
+      try { document.execCommand('copy'); ok(); } catch (_) { falha(); }
+      ta.remove();
+    }
   }
   function msgErroFirebase(e) {
     const code = (e && e.code) || '';
@@ -212,7 +259,9 @@
     const nome = $('#cadNome').value.trim();
     const email = $('#cadEmail').value.trim().toLowerCase();
     const senha = $('#cadSenha').value;
+    const pix = $('#cadPix').value.trim();
     if (!nome) { mostrarErroLogin('Informe seu nome completo.'); return; }
+    if (!pix) { mostrarErroLogin('Informe sua chave PIX — é por ela que você recebe os reembolsos.'); return; }
     const btn = e.target.querySelector('button');
     btn.disabled = true;
     cadastroEmAndamento = true;
@@ -221,7 +270,7 @@
       try {
         await cred.user.updateProfile({ displayName: nome });
         await db.collection('usuarios').doc(cred.user.uid).set({
-          nome: nome, email: email, papel: 'funcionario', criadoEm: FV.serverTimestamp()
+          nome: nome, email: email, pix: pix, papel: 'funcionario', criadoEm: FV.serverTimestamp()
         });
       } catch (errDoc) {
         // falha inesperada ao criar o perfil — o login completa depois
@@ -255,6 +304,7 @@
     perfil = null;
     if (!user) {
       minhas = []; todas = []; usuarios = [];
+      itens = [novoItem()];
       mostrarTela('telaLogin');
       return;
     }
@@ -277,6 +327,7 @@
     montarUI();
     assinarDados();
     mostrarTela('app');
+    if (!perfil.pix) abrirPixModal(true);
   }
 
   // ============================================================
@@ -289,6 +340,7 @@
       const novo = s.data();
       const mudouPapel = novo.papel !== perfil.papel;
       perfil = Object.assign({ uid: perfil.uid }, novo);
+      renderPixCard();
       if (mudouPapel) tratarAuth(usuarioAtual);
     }, () => {}));
 
@@ -300,7 +352,7 @@
     }, () => {}));
     unsubs.push(db.collection('config').doc('parametros').onSnapshot((s) => {
       params = Object.assign({}, PARAMS_PADRAO, s.exists ? s.data() : {});
-      atualizarHintsCategoria();
+      renderItens();
     }, () => {}));
 
     // Minhas solicitações (todos)
@@ -328,6 +380,7 @@
     document.querySelectorAll('.so-mod').forEach((el) => { el.hidden = !ehMod(); });
     $('#nvData').max = hojeISO();
     renderRegras();
+    renderItens();
     renderMinhas();
     if (ehMod()) { renderPainel(); renderEquipe(); }
     irParaAba(ehMod() ? 'painel' : 'minhas');
@@ -348,6 +401,49 @@
     });
     if (nome === 'nova') $('#nvData').max = hojeISO();
     window.scrollTo(0, 0);
+  }
+
+  // ============================================================
+  // CHAVE PIX
+  // ============================================================
+  function renderPixCard() {
+    const el = $('#pixCard');
+    if (!el || !perfil) return;
+    if (perfil.pix) {
+      el.innerHTML =
+        '<span class="pix-rotulo">💠 Chave PIX para reembolso:</span> <b>' + esc(perfil.pix) + '</b>' +
+        '<button class="btn" id="btnEditarPix">✏️ Alterar</button>';
+    } else {
+      el.innerHTML =
+        '<span class="pix-rotulo">💠 Você ainda não cadastrou sua chave PIX.</span>' +
+        '<button class="btn primario" id="btnEditarPix">Cadastrar PIX</button>';
+    }
+    el.hidden = false;
+    $('#btnEditarPix').addEventListener('click', () => abrirPixModal(false));
+  }
+
+  function abrirPixModal(primeiroAcesso) {
+    abrirModal(
+      '<h3>💠 ' + (primeiroAcesso ? 'Cadastre sua chave PIX' : 'Minha chave PIX') + '</h3>' +
+      (primeiroAcesso
+        ? '<p>É por ela que os reembolsos aprovados são pagos. Ela fica visível para os moderadores.</p>' : '') +
+      '<label>Chave PIX <span class="mini">(CPF, e-mail, telefone ou chave aleatória)</span>' +
+      '<input type="text" id="mdPix" value="' + esc((perfil && perfil.pix) || '') + '"></label>' +
+      '<div class="linha-botoes">' +
+      '<button class="btn" id="mdCancelar">' + (primeiroAcesso ? 'Agora não' : 'Cancelar') + '</button>' +
+      '<button class="btn primario" id="mdSalvarPix">Salvar</button></div>');
+    $('#mdCancelar').addEventListener('click', fecharModal);
+    $('#mdSalvarPix').addEventListener('click', async () => {
+      const pix = $('#mdPix').value.trim();
+      if (!pix) { toast('Informe a chave PIX.', 'erro'); return; }
+      try {
+        await db.collection('usuarios').doc(perfil.uid).update({ pix: pix });
+        perfil.pix = pix;
+        renderPixCard();
+        toast('Chave PIX salva!', 'ok');
+        fecharModal();
+      } catch (e2) { toast(msgErroFirebase(e2), 'erro'); }
+    });
   }
 
   // ============================================================
@@ -426,14 +522,10 @@
   });
 
   // ============================================================
-  // NOVA SOLICITAÇÃO
+  // NOVA SOLICITAÇÃO (várias despesas do dia num só envio)
   // ============================================================
-  const nvCategoria = $('#nvCategoria');
   const nvData = $('#nvData');
-  const nvKm = $('#nvKm');
-  const nvValor = $('#nvValor');
-  const nvJustificativa = $('#nvJustificativa');
-  const nvDescricao = $('#nvDescricao');
+  const nvItensEl = $('#nvItens');
   const alimBox = $('#alimBox');
 
   const HINTS = {
@@ -443,55 +535,157 @@
     'Hospedagem': () => 'Airbnb deve ser alinhado previamente com a Lilian (café da manhã: R$ 40,00).',
     'Outros': () => 'Descreva a despesa e anexe o cupom fiscal.'
   };
+  const CATEGORIAS = ['Alimentação', 'Uber', 'Combustível', 'Hospedagem', 'Outros'];
 
-  function atualizarHintsCategoria() {
-    const cat = nvCategoria.value;
-    const hint = $('#nvHint');
-    if (cat && HINTS[cat]) { hint.textContent = HINTS[cat](); hint.hidden = false; }
-    else hint.hidden = true;
-    $('#hintKm').textContent = fmtBRL(params.taxaKm) + ' por km — o valor é calculado automaticamente.';
+  function renderItens() {
+    if (!nvItensEl) return;
+    nvItensEl.innerHTML = itens.map((it, i) => {
+      let html = '<div class="item-despesa">' +
+        '<div class="item-topo"><span class="item-num">Despesa ' + (i + 1) + '</span>' +
+        (itens.length > 1
+          ? '<button type="button" class="btn perigo" data-acao="remover-item" data-idx="' + i + '">✕ Remover</button>'
+          : '') +
+        '</div>' +
+        '<label>Categoria<select data-idx="' + i + '" data-campo="categoria">' +
+        '<option value="">Selecione…</option>' +
+        CATEGORIAS.map((c) => '<option' + (it.categoria === c ? ' selected' : '') + '>' + c + '</option>').join('') +
+        '</select></label>';
+
+      if (it.categoria && HINTS[it.categoria])
+        html += '<p class="hint">' + esc(HINTS[it.categoria]()) + '</p>';
+
+      if (it.categoria === 'Uber') {
+        html += '<span class="rotulo">Categoria do Uber</span><div class="radios">' +
+          ['Uber X', 'Uber Comfort'].map((s) =>
+            '<label class="radio"><input type="radio" name="nvSubtipo' + i + '" value="' + s + '"' +
+            (it.subtipo === s ? ' checked' : '') + ' data-idx="' + i + '" data-campo="subtipo"> ' + s + '</label>'
+          ).join('') + '</div>';
+      }
+      if (it.categoria === 'Combustível') {
+        html += '<label>Quilômetros rodados' +
+          '<input type="text" inputmode="decimal" placeholder="ex.: 15,7" value="' + esc(it.km) + '"' +
+          ' data-idx="' + i + '" data-campo="km"></label>' +
+          '<p class="hint">' + esc(fmtBRL(params.taxaKm)) + ' por km — o valor é calculado automaticamente.</p>';
+      }
+
+      html += '<label>Valor (R$)' +
+        '<input type="text" inputmode="decimal" placeholder="ex.: 60,00" value="' + esc(it.valor) + '"' +
+        ' data-idx="' + i + '" data-campo="valor"' +
+        (it.categoria === 'Combustível' ? ' readonly' : '') + '></label>';
+
+      if (it.categoria === 'Uber' && it.subtipo === 'Uber Comfort') {
+        html += '<label>Justificativa <b class="obrig">(obrigatória para Uber Comfort)</b>' +
+          '<textarea rows="2" placeholder="Ex.: sem carros no Uber X, reunião com horário rígido…"' +
+          ' data-idx="' + i + '" data-campo="justificativa">' + esc(it.justificativa) + '</textarea></label>';
+      }
+
+      html += '<label>Descrição <b class="obrig">(obrigatória)</b>' +
+        '<input type="text" placeholder="ex.: almoço no evento de sábado" value="' + esc(it.descricao) + '"' +
+        ' data-idx="' + i + '" data-campo="descricao"></label>';
+
+      html += '<span class="rotulo">Comprovante <b class="obrig">(obrigatório — cupom fiscal)</b></span>';
+      if (it.comprovante) {
+        const kb = Math.round(it.comprovante.dados.length * 3 / 4 / 1024);
+        html += '<div class="preview">' +
+          (it.comprovante.mime === 'application/pdf'
+            ? '<span class="pdf-icone">📄</span>'
+            : '<img src="' + it.comprovante.dados + '" alt="comprovante">') +
+          '<div class="preview-info"><b>' + esc(it.comprovante.nome) + '</b>' +
+          '<span class="mini">' + kb + ' KB · pronto para envio</span></div>' +
+          '<button type="button" class="btn perigo" data-acao="remover-arq" data-idx="' + i + '">✕</button></div>';
+      } else {
+        html += '<label class="upload">' +
+          '<input type="file" accept="image/*,application/pdf" hidden data-idx="' + i + '" data-campo="arquivo">' +
+          '<span>📎 Tirar foto ou anexar arquivo</span></label>';
+      }
+
+      html += '</div>';
+      return html;
+    }).join('');
   }
 
-  function subtipoSelecionado() {
-    const r = document.querySelector('input[name="nvSubtipo"]:checked');
-    return r ? r.value : 'Uber X';
-  }
-
-  function aoMudarCategoria() {
-    const cat = nvCategoria.value;
-    $('#blocoSubtipo').hidden = (cat !== 'Uber');
-    $('#blocoKm').hidden = (cat !== 'Combustível');
-    atualizarJustificativa();
-    atualizarHintsCategoria();
-    if (cat === 'Combustível') {
-      nvValor.readOnly = true;
-      calcularCombustivel();
-    } else {
-      nvValor.readOnly = false;
+  nvItensEl.addEventListener('input', (e) => {
+    const el = e.target;
+    const idx = parseInt(el.dataset.idx, 10);
+    const campo = el.dataset.campo;
+    if (isNaN(idx) || !campo || !itens[idx]) return;
+    if (campo === 'km') {
+      itens[idx].km = el.value;
+      const km = parseValor(el.value);
+      itens[idx].valor = (km > 0) ? fmtNum(Math.round(km * params.taxaKm * 100) / 100) : '';
+      const valorInput = nvItensEl.querySelector('input[data-idx="' + idx + '"][data-campo="valor"]');
+      if (valorInput) valorInput.value = itens[idx].valor;
+    } else if (campo === 'valor' || campo === 'justificativa' || campo === 'descricao') {
+      itens[idx][campo] = el.value;
     }
-    checarAlimentacaoDebounced();
-  }
-  function atualizarJustificativa() {
-    const precisa = (nvCategoria.value === 'Uber' && subtipoSelecionado() === 'Uber Comfort');
-    $('#blocoJustificativa').hidden = !precisa;
-  }
-  function calcularCombustivel() {
-    const km = parseValor(nvKm.value);
-    nvValor.value = (km > 0) ? fmtNum(Math.round(km * params.taxaKm * 100) / 100) : '';
-  }
+    if (campo === 'valor') checarAlimentacaoDebounced();
+  });
 
-  nvCategoria.addEventListener('change', aoMudarCategoria);
-  document.querySelectorAll('input[name="nvSubtipo"]').forEach((r) =>
-    r.addEventListener('change', atualizarJustificativa));
-  nvKm.addEventListener('input', () => { calcularCombustivel(); checarAlimentacaoDebounced(); });
+  nvItensEl.addEventListener('change', async (e) => {
+    const el = e.target;
+    const idx = parseInt(el.dataset.idx, 10);
+    const campo = el.dataset.campo;
+    if (isNaN(idx) || !campo || !itens[idx]) return;
+    if (campo === 'categoria') {
+      itens[idx].categoria = el.value;
+      if (el.value === 'Combustível') { itens[idx].valor = ''; itens[idx].km = ''; }
+      renderItens();
+      checarAlimentacaoDebounced();
+    } else if (campo === 'subtipo') {
+      itens[idx].subtipo = el.value;
+      renderItens();
+    } else if (campo === 'arquivo') {
+      const file = el.files[0];
+      if (!file) return;
+      const span = el.parentElement.querySelector('span');
+      if (span) span.textContent = '⏳ Processando arquivo…';
+      try {
+        itens[idx].comprovante = await processarArquivo(file);
+      } catch (err) {
+        itens[idx].comprovante = null;
+        toast(err.message, 'erro');
+      }
+      renderItens();
+    }
+  });
 
-  // --- Validação automática de alimentação (limite do dia) ---
+  nvItensEl.addEventListener('click', (e) => {
+    const btn = e.target.closest('button[data-acao]');
+    if (!btn) return;
+    const idx = parseInt(btn.dataset.idx, 10);
+    if (btn.dataset.acao === 'remover-item') {
+      itens.splice(idx, 1);
+      if (!itens.length) itens.push(novoItem());
+      renderItens();
+      checarAlimentacaoDebounced();
+    }
+    if (btn.dataset.acao === 'remover-arq' && itens[idx]) {
+      itens[idx].comprovante = null;
+      renderItens();
+    }
+  });
+
+  $('#btnAddItem').addEventListener('click', () => {
+    if (itens.length >= MAX_ITENS) {
+      toast('Máximo de ' + MAX_ITENS + ' despesas por solicitação — envie esta e crie outra.', 'erro');
+      return;
+    }
+    itens.push(novoItem());
+    renderItens();
+  });
+
+  // --- Validação automática de alimentação (limite do dia, somando os itens) ---
   async function checarAlimentacao() {
     alimBox.hidden = true;
-    if (nvCategoria.value !== 'Alimentação') return null;
     const dataDesp = nvData.value;
-    const valor = parseValor(nvValor.value);
-    if (!dataDesp || !(valor > 0)) return null;
+    const alim = [];
+    itens.forEach((it, i) => {
+      if (it.categoria === 'Alimentação') {
+        const v = parseValor(it.valor);
+        if (v > 0) alim.push({ idx: i, valor: v });
+      }
+    });
+    if (!dataDesp || !alim.length) return null;
 
     const snap = await db.collection('solicitacoes')
       .where('uid', '==', perfil.uid)
@@ -505,19 +699,28 @@
     const somaAnterior = Math.round(anteriores.reduce((s, d) => s + efetivo(d), 0) * 100) / 100;
 
     const limite = params.limiteDiaAlimentacao;
-    const disponivel = Math.max(0, Math.round((limite - somaAnterior) * 100) / 100);
-    const considerado = Math.min(valor, disponivel);
-    const desconto = Math.round((valor - considerado) * 100) / 100;
-    const somaDia = Math.round((somaAnterior + valor) * 100) / 100;
+    let disponivel = Math.max(0, Math.round((limite - somaAnterior) * 100) / 100);
+    const porIdx = {};
+    let somaNovos = 0, descontoTotal = 0;
+    alim.forEach((a) => {
+      const considerado = Math.round(Math.min(a.valor, disponivel) * 100) / 100;
+      disponivel = Math.round((disponivel - considerado) * 100) / 100;
+      porIdx[a.idx] = { considerado: considerado, desconto: Math.round((a.valor - considerado) * 100) / 100 };
+      somaNovos = Math.round((somaNovos + a.valor) * 100) / 100;
+      descontoTotal = Math.round((descontoTotal + a.valor - considerado) * 100) / 100;
+    });
+    const somaDia = Math.round((somaAnterior + somaNovos) * 100) / 100;
 
-    if (desconto > 0) {
+    if (descontoTotal > 0) {
       alimBox.className = 'aviso';
       alimBox.innerHTML =
         '⚠️ <b>Limite diário de alimentação ultrapassado.</b><br>' +
-        'Dia ' + fmtData(dataDesp) + ': já lançado ' + fmtBRL(somaAnterior) +
-        ' + esta solicitação ' + fmtBRL(valor) + ' = <b>' + fmtBRL(somaDia) + '</b> (limite ' +
-        fmtBRL(limite) + ').<br>Desconto automático: <b>' + fmtBRL(desconto) +
-        '</b> → você recebe <b>' + fmtBRL(considerado) + '</b> desta solicitação.';
+        'Dia ' + fmtData(dataDesp) + ': ' +
+        (somaAnterior > 0 ? 'já lançado ' + fmtBRL(somaAnterior) + ' + ' : '') +
+        'alimentação desta solicitação ' + fmtBRL(somaNovos) + ' = <b>' + fmtBRL(somaDia) +
+        '</b> (limite ' + fmtBRL(limite) + ').<br>Desconto automático: <b>' + fmtBRL(descontoTotal) +
+        '</b> → você recebe <b>' + fmtBRL(Math.round((somaNovos - descontoTotal) * 100) / 100) +
+        '</b> de alimentação nesta solicitação.';
       alimBox.hidden = false;
     } else if (somaAnterior > 0) {
       alimBox.className = 'aviso ok';
@@ -526,13 +729,12 @@
         ' — dentro do limite de ' + fmtBRL(limite) + '.';
       alimBox.hidden = false;
     }
-    return { somaDia: somaDia, desconto: desconto, considerado: considerado };
+    return { porIdx: porIdx, somaDia: somaDia, descontoTotal: descontoTotal };
   }
   const checarAlimentacaoDebounced = debounce(() => {
     checarAlimentacao().catch(() => {});
   }, 500);
   nvData.addEventListener('change', checarAlimentacaoDebounced);
-  nvValor.addEventListener('input', checarAlimentacaoDebounced);
 
   // --- Comprovante: leitura + compressão ---
   function lerDataURL(file) {
@@ -582,113 +784,75 @@
     return { dados: dados, mime: 'image/jpeg', nome: file.name.replace(/\.\w+$/, '') + '.jpg' };
   }
 
-  $('#nvArquivo').addEventListener('change', async (e) => {
-    const file = e.target.files[0];
-    if (!file) return;
-    $('#uploadTexto').textContent = '⏳ Processando arquivo…';
-    try {
-      comprovante = await processarArquivo(file);
-    } catch (err) {
-      comprovante = null;
-      toast(err.message, 'erro');
-    }
-    $('#uploadTexto').textContent = '📎 Tirar foto ou anexar arquivo';
-    e.target.value = '';
-    renderPreview();
-  });
-
-  function renderPreview() {
-    const prev = $('#uploadPreview');
-    const area = $('#areaUpload');
-    if (!comprovante) {
-      prev.hidden = true; prev.innerHTML = '';
-      area.hidden = false;
-      return;
-    }
-    const kb = Math.round(comprovante.dados.length * 3 / 4 / 1024);
-    prev.innerHTML =
-      (comprovante.mime === 'application/pdf'
-        ? '<span class="pdf-icone">📄</span>'
-        : '<img src="' + comprovante.dados + '" alt="comprovante">') +
-      '<div class="preview-info"><b>' + esc(comprovante.nome) + '</b>' +
-      '<span class="mini">' + kb + ' KB · pronto para envio</span></div>' +
-      '<button type="button" class="btn perigo" id="btnRemoverArq">✕</button>';
-    prev.hidden = false;
-    area.hidden = true;
-    $('#btnRemoverArq').addEventListener('click', () => { comprovante = null; renderPreview(); });
-  }
-
-  // --- Envio ---
+  // --- Envio (um doc por despesa, todos ligados pelo mesmo loteId) ---
   $('#formNova').addEventListener('submit', async (e) => {
     e.preventDefault();
     const btn = $('#btnEnviar');
-    const cat = nvCategoria.value;
     const dataDesp = nvData.value;
 
     if (!dataDesp) { toast('Informe a data da despesa.', 'erro'); return; }
     if (dataDesp > hojeISO()) { toast('A data da despesa não pode ser futura.', 'erro'); return; }
-    if (!cat) { toast('Selecione a categoria.', 'erro'); return; }
 
-    let km = null;
-    if (cat === 'Combustível') {
-      km = parseValor(nvKm.value);
-      if (!(km > 0)) { toast('Informe os km rodados.', 'erro'); return; }
-      calcularCombustivel();
-    }
-    const valor = parseValor(nvValor.value);
-    if (!(valor > 0)) { toast('Informe um valor válido.', 'erro'); return; }
-
-    const subtipo = (cat === 'Uber') ? subtipoSelecionado() : null;
-    const justificativa = nvJustificativa.value.trim();
-    if (subtipo === 'Uber Comfort' && !justificativa) {
-      toast('Uber Comfort exige justificativa — explique a exceção.', 'erro');
-      $('#blocoJustificativa').hidden = false;
-      nvJustificativa.focus();
-      return;
-    }
-    if (!comprovante) {
-      toast('Anexe o comprovante — sem cupom fiscal não há reembolso.', 'erro');
-      return;
+    for (let i = 0; i < itens.length; i++) {
+      const it = itens[i];
+      const rot = itens.length > 1 ? 'Despesa ' + (i + 1) + ': ' : '';
+      if (!it.categoria) { toast(rot + 'selecione a categoria.', 'erro'); return; }
+      if (it.categoria === 'Combustível') {
+        const km = parseValor(it.km);
+        if (!(km > 0)) { toast(rot + 'informe os km rodados.', 'erro'); return; }
+        it.valor = fmtNum(Math.round(km * params.taxaKm * 100) / 100);
+      }
+      if (!(parseValor(it.valor) > 0)) { toast(rot + 'informe um valor válido.', 'erro'); return; }
+      if (it.categoria === 'Uber' && it.subtipo === 'Uber Comfort' && !it.justificativa.trim()) {
+        toast(rot + 'Uber Comfort exige justificativa — explique a exceção.', 'erro'); return;
+      }
+      if (!it.descricao.trim()) { toast(rot + 'a descrição é obrigatória.', 'erro'); return; }
+      if (!it.comprovante) { toast(rot + 'anexe o comprovante — sem cupom fiscal não há reembolso.', 'erro'); return; }
     }
 
     btn.disabled = true;
     btn.textContent = 'Enviando…';
     try {
-      let alim = null;
-      if (cat === 'Alimentação') alim = await checarAlimentacao();
-
-      const id = db.collection('solicitacoes').doc().id;
+      const alim = await checarAlimentacao();
+      const loteId = db.collection('solicitacoes').doc().id;
       const batch = db.batch();
-      batch.set(db.collection('comprovantes').doc(id), {
-        uid: perfil.uid, dados: comprovante.dados, mime: comprovante.mime,
-        nome: comprovante.nome, criadoEm: FV.serverTimestamp()
-      });
-      batch.set(db.collection('solicitacoes').doc(id), {
-        uid: perfil.uid,
-        nome: perfil.nome,
-        dataDespesa: dataDesp,
-        categoria: cat,
-        subtipo: subtipo,
-        km: km,
-        valor: valor,
-        descricao: nvDescricao.value.trim(),
-        justificativa: justificativa,
-        status: 'pendente',
-        observacao: '',
-        valorSugerido: alim ? alim.considerado : valor,
-        alimDesconto: alim ? alim.desconto : 0,
-        alimTotalDia: alim ? alim.somaDia : null,
-        comprovanteMime: comprovante.mime,
-        criadoEm: FV.serverTimestamp()
+      itens.forEach((it, i) => {
+        const id = db.collection('solicitacoes').doc().id;
+        const valor = parseValor(it.valor);
+        const a = alim && alim.porIdx[i] ? alim.porIdx[i] : null;
+        batch.set(db.collection('comprovantes').doc(id), {
+          uid: perfil.uid, dados: it.comprovante.dados, mime: it.comprovante.mime,
+          nome: it.comprovante.nome, criadoEm: FV.serverTimestamp()
+        });
+        batch.set(db.collection('solicitacoes').doc(id), {
+          uid: perfil.uid,
+          nome: perfil.nome,
+          loteId: loteId,
+          dataDespesa: dataDesp,
+          categoria: it.categoria,
+          subtipo: it.categoria === 'Uber' ? it.subtipo : null,
+          km: it.categoria === 'Combustível' ? parseValor(it.km) : null,
+          valor: valor,
+          descricao: it.descricao.trim(),
+          justificativa: (it.categoria === 'Uber' && it.subtipo === 'Uber Comfort') ? it.justificativa.trim() : '',
+          status: 'pendente',
+          observacao: '',
+          valorSugerido: a ? a.considerado : valor,
+          alimDesconto: a ? a.desconto : 0,
+          alimTotalDia: a ? alim.somaDia : null,
+          comprovanteMime: it.comprovante.mime,
+          criadoEm: FV.serverTimestamp()
+        });
       });
       await batch.commit();
 
-      toast('Solicitação enviada! Acompanhe em "Minhas".', 'ok');
+      toast(itens.length > 1
+        ? 'Solicitação enviada com ' + itens.length + ' despesas! Acompanhe em "Minhas".'
+        : 'Solicitação enviada! Acompanhe em "Minhas".', 'ok');
       e.target.reset();
-      comprovante = null;
-      renderPreview();
+      itens = [novoItem()];
+      renderItens();
       alimBox.hidden = true;
-      aoMudarCategoria();
       irParaAba('minhas');
     } catch (err) {
       toast(msgErroFirebase(err), 'erro');
@@ -701,40 +865,50 @@
   // MINHAS SOLICITAÇÕES
   // ============================================================
   function renderMinhas() {
+    renderPixCard();
     const lista = $('#listaMinhas');
     const arr = minhas.slice().sort(ordCriado);
     if (!arr.length) {
       lista.innerHTML = '<div class="cartao vazio">Nenhuma solicitação ainda.<br>Crie a primeira na aba ➕ Nova.</div>';
       return;
     }
-    lista.innerHTML = arr.map((s) => {
-      let extras = '';
-      if (s.status === 'pendente' && s.alimDesconto > 0)
-        extras += '<div class="sol-alerta">⚠️ Sujeita a desconto de ' + fmtBRL(s.alimDesconto) +
-          ' (limite do dia) → reembolso previsto ' + fmtBRL(s.valorSugerido) + '</div>';
-      if (s.status === 'aprovada')
-        extras += '<div class="sol-obs-ok">✓ Aprovada: <b>' + fmtBRL(s.valorAprovado) + '</b>' +
-          (typeof s.valorAprovado === 'number' && s.valorAprovado !== s.valor
-            ? ' <span class="mini">(solicitado ' + fmtBRL(s.valor) + ')</span>' : '') +
-          (s.observacao ? '<br>' + esc(s.observacao) : '') + '</div>';
-      if (s.status === 'negada')
-        extras += '<div class="sol-obs"><b>Motivo da negativa:</b> ' + esc(s.observacao || '—') + '</div>';
-      return '<div class="cartao sol">' +
-        '<div class="sol-topo"><span class="chip chip-' + s.status + '">' + rotuloStatus(s.status) +
-        '</span><b>' + fmtBRL(s.valor) + '</b></div>' +
-        '<div class="sol-info">' + esc(s.categoria) +
-        (s.subtipo ? ' · ' + esc(s.subtipo) : '') +
-        (s.km ? ' · ' + fmtNum(s.km) + ' km' : '') +
-        ' · ' + fmtData(s.dataDespesa) + '</div>' +
-        (s.descricao ? '<div class="sol-info">' + esc(s.descricao) + '</div>' : '') +
-        (s.justificativa ? '<div class="sol-just"><b>Justificativa:</b> ' + esc(s.justificativa) + '</div>' : '') +
-        extras +
-        '<div class="sol-botoes">' +
-        '<button class="btn" data-acao="ver" data-id="' + s.id + '">📄 Comprovante</button>' +
-        (s.status === 'pendente'
-          ? '<button class="btn perigo" data-acao="excluir" data-id="' + s.id + '">🗑 Excluir</button>' : '') +
-        '</div></div>';
+    lista.innerHTML = agruparPorLote(arr).map((g) => {
+      const total = g.reduce((t, s) => t + (s.valor || 0), 0);
+      const cab = g.length > 1
+        ? '<div class="grupo-cab"><b>Solicitação de ' + fmtData(g[0].dataDespesa) + '</b>' +
+          '<span class="mini">' + g.length + ' despesas · ' + fmtBRL(total) + '</span></div>'
+        : '';
+      return '<div class="cartao sol">' + cab +
+        g.map((s) => itemMinhasHTML(s)).join('<hr class="sol-sep">') + '</div>';
     }).join('');
+  }
+
+  function itemMinhasHTML(s) {
+    let extras = '';
+    if (s.status === 'pendente' && s.alimDesconto > 0)
+      extras += '<div class="sol-alerta">⚠️ Sujeita a desconto de ' + fmtBRL(s.alimDesconto) +
+        ' (limite do dia) → reembolso previsto ' + fmtBRL(s.valorSugerido) + '</div>';
+    if (s.status === 'aprovada')
+      extras += '<div class="sol-obs-ok">✓ Aprovada' + (ehParcial(s) ? ' parcialmente' : '') +
+        ': <b>' + fmtBRL(s.valorAprovado) + '</b>' +
+        (ehParcial(s) ? ' <span class="mini">(solicitado ' + fmtBRL(s.valor) + ')</span>' : '') +
+        (s.observacao ? '<br>' + esc(s.observacao) : '') + '</div>';
+    if (s.status === 'negada')
+      extras += '<div class="sol-obs"><b>Motivo da negativa:</b> ' + esc(s.observacao || '—') + '</div>';
+    return '<div class="sol-item">' +
+      '<div class="sol-topo">' + chipDe(s) + '<b>' + fmtBRL(s.valor) + '</b></div>' +
+      '<div class="sol-info">' + esc(s.categoria) +
+      (s.subtipo ? ' · ' + esc(s.subtipo) : '') +
+      (s.km ? ' · ' + fmtNum(s.km) + ' km' : '') +
+      ' · ' + fmtData(s.dataDespesa) + '</div>' +
+      (s.descricao ? '<div class="sol-info">' + esc(s.descricao) + '</div>' : '') +
+      (s.justificativa ? '<div class="sol-just"><b>Justificativa:</b> ' + esc(s.justificativa) + '</div>' : '') +
+      extras +
+      '<div class="sol-botoes">' +
+      '<button class="btn" data-acao="ver" data-id="' + s.id + '">📄 Comprovante</button>' +
+      (s.status === 'pendente'
+        ? '<button class="btn perigo" data-acao="excluir" data-id="' + s.id + '">🗑 Excluir</button>' : '') +
+      '</div></div>';
   }
 
   $('#listaMinhas').addEventListener('click', (e) => {
@@ -746,8 +920,8 @@
 
   function confirmarExcluir(id) {
     abrirModal(
-      '<h3>Excluir solicitação?</h3>' +
-      '<p>A solicitação e o comprovante serão apagados. Essa ação não pode ser desfeita.</p>' +
+      '<h3>Excluir despesa?</h3>' +
+      '<p>A despesa e o comprovante serão apagados. Essa ação não pode ser desfeita.</p>' +
       '<div class="linha-botoes">' +
       '<button class="btn" id="mdCancelar">Cancelar</button>' +
       '<button class="btn perigo" id="mdConfirmar">🗑 Excluir</button></div>');
@@ -758,7 +932,7 @@
         batch.delete(db.collection('solicitacoes').doc(id));
         batch.delete(db.collection('comprovantes').doc(id));
         await batch.commit();
-        toast('Solicitação excluída.', 'ok');
+        toast('Despesa excluída.', 'ok');
       } catch (e2) { toast(msgErroFirebase(e2), 'erro'); }
       fecharModal();
     });
@@ -833,55 +1007,85 @@
       .sort(ordCriado);
 
     const lista = $('#listaPainel');
-    lista.innerHTML = !arr.length
-      ? '<div class="cartao vazio">Nada por aqui com esses filtros. 🎉</div>'
-      : arr.map((s) =>
-        '<div class="cartao sol">' +
-        '<div class="sol-nome">' + esc(nomeDe(s)) + '</div>' +
-        '<div class="sol-topo"><span class="chip chip-' + s.status + '">' + rotuloStatus(s.status) +
-        '</span><b>' + fmtBRL(s.valor) + '</b></div>' +
-        '<div class="sol-info">' + esc(s.categoria) +
-        (s.subtipo ? ' · ' + esc(s.subtipo) : '') +
-        (s.km ? ' · ' + fmtNum(s.km) + ' km' : '') +
-        ' · ' + fmtData(s.dataDespesa) + '</div>' +
-        (s.descricao ? '<div class="sol-info">' + esc(s.descricao) + '</div>' : '') +
-        (s.justificativa ? '<div class="sol-just"><b>Justificativa:</b> ' + esc(s.justificativa) + '</div>' : '') +
-        (s.alimDesconto > 0
-          ? '<div class="sol-alerta">⚠️ Excede o limite diário de alimentação — desconto sugerido ' +
-            fmtBRL(s.alimDesconto) + ' → reembolso ' + fmtBRL(s.valorSugerido) + '</div>' : '') +
-        (s.status === 'aprovada'
-          ? '<div class="sol-obs-ok">✓ Aprovada: <b>' + fmtBRL(s.valorAprovado) + '</b>' +
-            (s.moderadoPor ? ' · por ' + esc(s.moderadoPor) : '') +
-            (s.observacao ? '<br>' + esc(s.observacao) : '') + '</div>' : '') +
-        (s.status === 'negada'
-          ? '<div class="sol-obs"><b>Negada' + (s.moderadoPor ? ' por ' + esc(s.moderadoPor) : '') +
-            ':</b> ' + esc(s.observacao) + '</div>' : '') +
-        '<div class="sol-botoes">' +
-        '<button class="btn" data-acao="ver" data-id="' + s.id + '">📄 Comprovante</button>' +
-        (s.status === 'pendente'
-          ? '<button class="btn sucesso" data-acao="aprovar" data-id="' + s.id + '">✓ Aprovar</button>' +
-            '<button class="btn perigo" data-acao="negar" data-id="' + s.id + '">✕ Negar</button>'
-          : '') +
-        '</div></div>').join('');
+    if (!arr.length) {
+      lista.innerHTML = '<div class="cartao vazio">Nada por aqui com esses filtros. 🎉</div>';
+      renderTotalizador();
+      return;
+    }
+
+    lista.innerHTML = agruparPorLote(arr).map((g) => {
+      const pix = pixDe(g[0].uid);
+      const chaveLote = g[0].loteId || g[0].id;
+      const totalLote = g[0].loteId ? todas.filter((s) => s.loteId === g[0].loteId).length : 1;
+      const pend = g.filter((s) => s.status === 'pendente');
+      let cab = '<div class="sol-nome">' + esc(nomeDe(g[0])) + '</div>' +
+        '<div class="pix-linha">' + (pix
+          ? '💠 PIX: <b>' + esc(pix) + '</b><button class="btn btn-copiar" data-acao="copiar-pix" data-pix="' +
+            esc(pix) + '">⧉ copiar</button>'
+          : '💠 PIX não cadastrado') + '</div>';
+      if (totalLote > 1)
+        cab += '<div class="sol-info">Solicitação de ' + fmtData(g[0].dataDespesa) + ' com ' + totalLote +
+          ' despesas' + (g.length < totalLote ? ' — mostrando ' + g.length + ' (filtro de status)' : '') + '</div>';
+      const rodape = pend.length > 1
+        ? '<div class="sol-botoes lote-botoes"><button class="btn sucesso" data-acao="aprovar-lote" data-lote="' +
+          chaveLote + '">✓ Aprovar as ' + pend.length + ' pendentes</button></div>'
+        : '';
+      return '<div class="cartao sol">' + cab +
+        g.map((s) => itemPainelHTML(s)).join('<hr class="sol-sep">') + rodape + '</div>';
+    }).join('');
 
     renderTotalizador();
+  }
+
+  function itemPainelHTML(s) {
+    return '<div class="sol-item">' +
+      '<div class="sol-topo">' + chipDe(s) + '<b>' + fmtBRL(s.valor) + '</b></div>' +
+      '<div class="sol-info">' + esc(s.categoria) +
+      (s.subtipo ? ' · ' + esc(s.subtipo) : '') +
+      (s.km ? ' · ' + fmtNum(s.km) + ' km' : '') +
+      ' · ' + fmtData(s.dataDespesa) + '</div>' +
+      (s.descricao ? '<div class="sol-info">' + esc(s.descricao) + '</div>' : '') +
+      (s.justificativa ? '<div class="sol-just"><b>Justificativa:</b> ' + esc(s.justificativa) + '</div>' : '') +
+      (s.alimDesconto > 0
+        ? '<div class="sol-alerta">⚠️ Excede o limite diário de alimentação — desconto sugerido ' +
+          fmtBRL(s.alimDesconto) + ' → reembolso ' + fmtBRL(s.valorSugerido) + '</div>' : '') +
+      (s.status === 'aprovada'
+        ? '<div class="sol-obs-ok">✓ Aprovada' + (ehParcial(s) ? ' parcialmente' : '') +
+          ': <b>' + fmtBRL(s.valorAprovado) + '</b>' +
+          (ehParcial(s) ? ' <span class="mini">(solicitado ' + fmtBRL(s.valor) + ')</span>' : '') +
+          (s.moderadoPor ? ' · por ' + esc(s.moderadoPor) : '') +
+          (s.observacao ? '<br>' + esc(s.observacao) : '') + '</div>' : '') +
+      (s.status === 'negada'
+        ? '<div class="sol-obs"><b>Negada' + (s.moderadoPor ? ' por ' + esc(s.moderadoPor) : '') +
+          ':</b> ' + esc(s.observacao) + '</div>' : '') +
+      '<div class="sol-botoes">' +
+      '<button class="btn" data-acao="ver" data-id="' + s.id + '">📄 Comprovante</button>' +
+      (s.status === 'pendente'
+        ? '<button class="btn sucesso" data-acao="aprovar" data-id="' + s.id + '">✓ Aprovar</button>' +
+          '<button class="btn perigo" data-acao="negar" data-id="' + s.id + '">✕ Negar</button>'
+        : '') +
+      '</div></div>';
   }
 
   $('#listaPainel').addEventListener('click', (e) => {
     const btn = e.target.closest('button[data-acao]');
     if (!btn) return;
+    const acao = btn.dataset.acao;
+    if (acao === 'copiar-pix') { copiarTexto(btn.dataset.pix); return; }
+    if (acao === 'aprovar-lote') { abrirAprovarLote(btn.dataset.lote); return; }
     const sol = todas.find((s) => s.id === btn.dataset.id);
-    if (btn.dataset.acao === 'ver') verComprovante(btn.dataset.id);
-    if (btn.dataset.acao === 'aprovar' && sol) abrirAprovar(sol);
-    if (btn.dataset.acao === 'negar' && sol) abrirNegar(sol);
+    if (acao === 'ver') verComprovante(btn.dataset.id);
+    if (acao === 'aprovar' && sol) abrirAprovar(sol);
+    if (acao === 'negar' && sol) abrirNegar(sol);
   });
 
   function abrirAprovar(sol) {
-    const sugerido = typeof sol.valorSugerido === 'number' ? sol.valorSugerido : sol.valor;
+    const sugerido = sugeridoDe(sol);
     abrirModal(
-      '<h3>Aprovar solicitação</h3>' +
+      '<h3>Aprovar despesa</h3>' +
       '<p><b>' + esc(nomeDe(sol)) + '</b> — ' + esc(sol.categoria) +
       (sol.subtipo ? ' (' + esc(sol.subtipo) + ')' : '') + ' — ' + fmtData(sol.dataDespesa) + '</p>' +
+      (sol.descricao ? '<p class="mini">' + esc(sol.descricao) + '</p>' : '') +
       '<p>Valor solicitado: <b>' + fmtBRL(sol.valor) + '</b></p>' +
       (sol.alimDesconto > 0
         ? '<div class="aviso">⚠️ Limite diário de alimentação ultrapassado. Desconto sugerido: <b>' +
@@ -889,7 +1093,7 @@
         : '') +
       '<label>Valor a reembolsar (R$)' +
       '<input type="text" id="mdValorAprovado" inputmode="decimal" value="' + fmtNum(sugerido) + '"></label>' +
-      '<label>Observação <span class="mini">(opcional — fica visível para o funcionário)</span>' +
+      '<label>Observação <span class="mini">(obrigatória se aprovar menos que o solicitado — fica visível para o funcionário)</span>' +
       '<textarea id="mdObsAprovar" rows="2"></textarea></label>' +
       '<div class="linha-botoes">' +
       '<button class="btn" id="mdCancelar">Cancelar</button>' +
@@ -897,13 +1101,19 @@
     $('#mdCancelar').addEventListener('click', fecharModal);
     $('#mdConfirmar').addEventListener('click', async () => {
       const v = parseValor($('#mdValorAprovado').value);
+      const obs = $('#mdObsAprovar').value.trim();
       if (!(v >= 0)) { toast('Valor inválido.', 'erro'); return; }
       if (v > sol.valor) { toast('O valor aprovado não pode ser maior que o solicitado (' + fmtBRL(sol.valor) + ').', 'erro'); return; }
+      if (v < sol.valor && v !== sugerido && !obs) {
+        toast('Aprovação parcial exige observação — explique o motivo para o funcionário.', 'erro');
+        $('#mdObsAprovar').focus();
+        return;
+      }
       try {
         await db.collection('solicitacoes').doc(sol.id).update({
           status: 'aprovada',
           valorAprovado: v,
-          observacao: $('#mdObsAprovar').value.trim(),
+          observacao: obs,
           moderadoPor: perfil.nome,
           moderadoEm: FV.serverTimestamp()
         });
@@ -913,11 +1123,51 @@
     });
   }
 
+  function abrirAprovarLote(chaveLote) {
+    const pend = todas.filter((s) => (s.loteId || s.id) === chaveLote && s.status === 'pendente');
+    if (!pend.length) return;
+    const total = pend.reduce((t, s) => t + sugeridoDe(s), 0);
+    abrirModal(
+      '<h3>Aprovar todas as pendentes</h3>' +
+      '<p><b>' + esc(nomeDe(pend[0])) + '</b> — solicitação de ' + fmtData(pend[0].dataDespesa) + '</p>' +
+      '<ul class="lote-lista">' + pend.map((s) =>
+        '<li>' + esc(s.categoria) + (s.subtipo ? ' (' + esc(s.subtipo) + ')' : '') +
+        (s.descricao ? ' — ' + esc(s.descricao) : '') + ': <b>' + fmtBRL(sugeridoDe(s)) + '</b>' +
+        (s.alimDesconto > 0
+          ? ' <span class="mini">(desconto do limite do dia: ' + fmtBRL(s.alimDesconto) + ')</span>' : '') +
+        '</li>').join('') + '</ul>' +
+      '<p>Total a aprovar: <b>' + fmtBRL(Math.round(total * 100) / 100) + '</b></p>' +
+      '<p class="mini">Cada despesa é aprovada pelo valor sugerido. Para ajustar o valor ou negar uma delas, use os botões da própria despesa.</p>' +
+      '<div class="linha-botoes">' +
+      '<button class="btn" id="mdCancelar">Cancelar</button>' +
+      '<button class="btn sucesso" id="mdConfirmar">✓ Aprovar ' + pend.length + ' despesas</button></div>');
+    $('#mdCancelar').addEventListener('click', fecharModal);
+    $('#mdConfirmar').addEventListener('click', async () => {
+      try {
+        const batch = db.batch();
+        pend.forEach((s) => {
+          batch.update(db.collection('solicitacoes').doc(s.id), {
+            status: 'aprovada',
+            valorAprovado: sugeridoDe(s),
+            observacao: '',
+            moderadoPor: perfil.nome,
+            moderadoEm: FV.serverTimestamp()
+          });
+        });
+        await batch.commit();
+        toast(pend.length + ' despesas aprovadas.', 'ok');
+        fecharModal();
+      } catch (e2) { toast(msgErroFirebase(e2), 'erro'); }
+    });
+  }
+
   function abrirNegar(sol) {
     abrirModal(
-      '<h3>Negar solicitação</h3>' +
+      '<h3>Negar despesa</h3>' +
       '<p><b>' + esc(nomeDe(sol)) + '</b> — ' + esc(sol.categoria) + ' — ' +
       fmtBRL(sol.valor) + ' — ' + fmtData(sol.dataDespesa) + '</p>' +
+      (sol.descricao ? '<p class="mini">' + esc(sol.descricao) + '</p>' : '') +
+      '<p class="mini">Só esta despesa será negada — as outras da mesma solicitação não são afetadas.</p>' +
       '<label>Motivo da negativa <b class="obrig">(obrigatório — o funcionário vai ler)</b>' +
       '<textarea id="mdObsNegar" rows="3" placeholder="Ex.: comprovante é print de pix, não cupom fiscal…"></textarea></label>' +
       '<div class="linha-botoes">' +
@@ -934,7 +1184,7 @@
           moderadoPor: perfil.nome,
           moderadoEm: FV.serverTimestamp()
         });
-        toast('Solicitação negada.', 'ok');
+        toast('Despesa negada.', 'ok');
         fecharModal();
       } catch (e2) { toast(msgErroFirebase(e2), 'erro'); }
     });
@@ -949,7 +1199,7 @@
     const porFunc = {};
     arr.forEach((s) => {
       const g = porFunc[s.uid] || (porFunc[s.uid] = {
-        nome: nomeDe(s), pendQtd: 0, pendVal: 0, aprQtd: 0, aprVal: 0, negQtd: 0
+        nome: nomeDe(s), pix: pixDe(s.uid), pendQtd: 0, pendVal: 0, aprQtd: 0, aprVal: 0, negQtd: 0
       });
       if (s.status === 'pendente') { g.pendQtd++; g.pendVal += s.valor || 0; }
       if (s.status === 'aprovada') {
@@ -971,17 +1221,20 @@
     }), { pendQtd: 0, pendVal: 0, aprQtd: 0, aprVal: 0, negQtd: 0 });
 
     el.innerHTML = '<table><thead><tr>' +
-      '<th>Funcionário</th><th class="num">Pend.</th><th class="num">R$ pendente</th>' +
+      '<th>Funcionário</th><th>PIX</th><th class="num">Pend.</th><th class="num">R$ pendente</th>' +
       '<th class="num">Aprov.</th><th class="num">R$ a pagar</th><th class="num">Neg.</th>' +
       '</tr></thead><tbody>' +
       grupos.map((g) =>
         '<tr><td>' + esc(g.nome) + '</td>' +
+        '<td>' + (g.pix
+          ? esc(g.pix) + ' <button class="btn btn-copiar" data-pix="' + esc(g.pix) + '">⧉</button>'
+          : '<span class="mini">—</span>') + '</td>' +
         '<td class="num">' + g.pendQtd + '</td>' +
         '<td class="num">' + fmtBRL(g.pendVal) + '</td>' +
         '<td class="num">' + g.aprQtd + '</td>' +
         '<td class="num">' + fmtBRL(g.aprVal) + '</td>' +
         '<td class="num">' + g.negQtd + '</td></tr>').join('') +
-      '<tr class="total-geral"><td>Total</td>' +
+      '<tr class="total-geral"><td>Total</td><td></td>' +
       '<td class="num">' + tot.pendQtd + '</td>' +
       '<td class="num">' + fmtBRL(tot.pendVal) + '</td>' +
       '<td class="num">' + tot.aprQtd + '</td>' +
@@ -989,6 +1242,11 @@
       '<td class="num">' + tot.negQtd + '</td></tr>' +
       '</tbody></table>';
   }
+
+  $('#totalizador').addEventListener('click', (e) => {
+    const btn = e.target.closest('button[data-pix]');
+    if (btn) copiarTexto(btn.dataset.pix);
+  });
 
   // ============================================================
   // EQUIPE (moderador)
@@ -1001,7 +1259,8 @@
         '<div class="usuario-linha">' +
         '<div class="usuario-info"><b>' + esc(u.nome) +
         (u.id === perfil.uid ? ' <span class="mini">(você)</span>' : '') +
-        '</b><span>' + esc(u.email) + '</span></div>' +
+        '</b><span>' + esc(u.email) +
+        (u.pix ? ' · 💠 ' + esc(u.pix) : ' · 💠 sem PIX') + '</span></div>' +
         '<select data-uid="' + u.id + '"' + (u.id === perfil.uid ? ' disabled' : '') + '>' +
         '<option value="funcionario"' + (u.papel === 'funcionario' ? ' selected' : '') + '>Funcionário</option>' +
         '<option value="moderador"' + (u.papel === 'moderador' ? ' selected' : '') + '>Moderador</option>' +

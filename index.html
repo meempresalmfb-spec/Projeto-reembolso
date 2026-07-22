@@ -57,6 +57,9 @@
       <label>Senha <span class="mini">(mínimo 6 caracteres)</span>
         <input type="password" id="cadSenha" autocomplete="new-password" minlength="6" required>
       </label>
+      <label>Chave PIX <span class="mini">(para receber os reembolsos — CPF, e-mail, telefone ou chave aleatória)</span>
+        <input type="text" id="cadPix" required>
+      </label>
       <button type="submit" class="btn primario grande">Criar conta</button>
       <div class="links-login">
         <a href="#" id="linkVoltarLogin">← Já tenho conta</a>
@@ -132,60 +135,17 @@
     <!-- ===== Nova Solicitação ===== -->
     <section id="secNova" class="secao" hidden>
       <h2>Nova Solicitação</h2>
+      <p class="mini">Lance todas as despesas do dia de uma vez — ex.: café, almoço e jantar — cada uma com o próprio comprovante.</p>
       <form id="formNova" class="cartao" novalidate>
         <label>Data da despesa
           <input type="date" id="nvData" required>
         </label>
 
-        <label>Categoria
-          <select id="nvCategoria" required>
-            <option value="">Selecione…</option>
-            <option>Alimentação</option>
-            <option>Uber</option>
-            <option>Combustível</option>
-            <option>Hospedagem</option>
-            <option>Outros</option>
-          </select>
-        </label>
-        <p id="nvHint" class="hint" hidden></p>
+        <div id="nvItens"></div>
 
-        <div id="blocoSubtipo" hidden>
-          <span class="rotulo">Categoria do Uber</span>
-          <div class="radios">
-            <label class="radio"><input type="radio" name="nvSubtipo" value="Uber X" checked> Uber X</label>
-            <label class="radio"><input type="radio" name="nvSubtipo" value="Uber Comfort"> Uber Comfort</label>
-          </div>
-        </div>
-
-        <div id="blocoKm" hidden>
-          <label>Quilômetros rodados
-            <input type="text" id="nvKm" inputmode="decimal" placeholder="ex.: 15,7">
-          </label>
-          <p class="hint" id="hintKm"></p>
-        </div>
-
-        <label>Valor (R$)
-          <input type="text" id="nvValor" inputmode="decimal" placeholder="ex.: 60,00" required>
-        </label>
+        <button type="button" class="btn" id="btnAddItem">➕ Adicionar outra despesa</button>
 
         <div id="alimBox" class="aviso" hidden></div>
-
-        <div id="blocoJustificativa" hidden>
-          <label>Justificativa <b class="obrig">(obrigatória para Uber Comfort)</b>
-            <textarea id="nvJustificativa" rows="2" placeholder="Ex.: sem carros no Uber X, reunião com horário rígido…"></textarea>
-          </label>
-        </div>
-
-        <label>Descrição <span class="mini">(opcional)</span>
-          <input type="text" id="nvDescricao" placeholder="ex.: almoço no evento de sábado">
-        </label>
-
-        <span class="rotulo">Comprovante <b class="obrig">(obrigatório — cupom fiscal)</b></span>
-        <label class="upload" id="areaUpload">
-          <input type="file" id="nvArquivo" accept="image/*,application/pdf" hidden>
-          <span id="uploadTexto">📎 Tirar foto ou anexar arquivo</span>
-        </label>
-        <div id="uploadPreview" class="preview" hidden></div>
 
         <button type="submit" class="btn primario grande" id="btnEnviar">Enviar solicitação</button>
       </form>
@@ -194,6 +154,7 @@
     <!-- ===== Minhas Solicitações ===== -->
     <section id="secMinhas" class="secao" hidden>
       <h2>Minhas Solicitações</h2>
+      <div id="pixCard" class="cartao pix-card" hidden></div>
       <div id="listaMinhas"></div>
     </section>
 

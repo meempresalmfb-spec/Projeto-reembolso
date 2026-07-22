@@ -365,6 +365,50 @@ select option { background: var(--bordeaux-deep); color: var(--cream); }
 .chip-pendente { background: var(--pend-bg); color: var(--pend-tx); border: 1px solid rgba(201, 169, 97, .3); }
 .chip-aprovada { background: var(--aprov-bg); color: var(--aprov-tx); border: 1px solid rgba(64, 160, 90, .3); }
 .chip-negada { background: var(--neg-bg); color: var(--neg-tx); border: 1px solid rgba(230, 57, 70, .3); }
+.chip-parcial { background: rgba(230, 150, 57, .16); color: #F2C08F; border: 1px solid rgba(230, 150, 57, .38); }
+
+/* ===== Itens da nova solicitação (várias despesas por envio) ===== */
+.item-despesa {
+  border: 1px solid var(--borda);
+  border-radius: 8px;
+  padding: 12px 14px 14px;
+  margin: 12px 0;
+  background: rgba(0, 0, 0, .14);
+}
+.item-topo { display: flex; align-items: center; justify-content: space-between; margin-bottom: 2px; }
+.item-num { font-family: var(--serif); font-weight: 600; color: var(--gold); font-size: .95rem; }
+.item-topo .btn { padding: 4px 10px; font-size: .78rem; }
+#btnAddItem { width: 100%; border-style: dashed; }
+
+/* ===== Grupos de despesas (lotes) e PIX ===== */
+.sol-sep { border: none; border-top: 1px dashed rgba(201, 169, 97, .25); margin: 12px 0; }
+.grupo-cab {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+  border-bottom: 1px solid rgba(201, 169, 97, .2);
+  padding-bottom: 8px;
+  margin-bottom: 10px;
+}
+.grupo-cab b { font-family: var(--serif); color: var(--gold); }
+.pix-linha { font-size: .85rem; color: var(--texto-suave); margin: 2px 0 4px; }
+.pix-linha b { color: var(--gold-light); word-break: break-all; }
+.btn-copiar { padding: 2px 8px; font-size: .74rem; margin-left: 6px; }
+.pix-card {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  padding: 12px 16px;
+  font-size: .92rem;
+}
+.pix-card b { color: var(--gold-light); word-break: break-all; }
+.pix-card .pix-rotulo { color: var(--texto-suave); }
+.pix-card .btn { margin-left: auto; padding: 6px 12px; font-size: .82rem; }
+.lote-lista { margin: 8px 0; padding-left: 20px; font-size: .92rem; }
+.lote-lista li { margin: 4px 0; }
+.lote-botoes { border-top: 1px dashed rgba(201, 169, 97, .25); padding-top: 12px; }
 
 .vazio {
   text-align: center;
