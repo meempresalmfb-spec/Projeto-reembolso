@@ -8,10 +8,17 @@ rules_version = '2';
 // Garantias impostas PELO SERVIDOR (não só pela interface):
 // - Funcionário só lê as PRÓPRIAS solicitações e comprovantes.
 // - Moderador (papel no doc usuarios/) lê tudo e é o único que
-//   aprova/nega; negar EXIGE observação não vazia.
+//   aprova/nega; negar EXIGE observação não vazia; aprovar por
+//   valor menor que o solicitado (parcial) também EXIGE observação
+//   (exceto quando é exatamente o valor sugerido pelo desconto
+//   automático de alimentação).
+// - Cada despesa é um doc próprio (várias do mesmo envio dividem o
+//   loteId), então cada uma é aprovada/negada individualmente.
+// - Descrição da despesa é obrigatória na criação.
 // - Cadastro aberto: qualquer um com o link cria conta, mas SEMPRE
 //   como funcionário — moderador só via promoção.
 // - Ninguém se autopromove a moderador.
+// - Cada um só edita o próprio nome e a própria chave PIX.
 // - Solicitação nasce sempre 'pendente' e sempre em par com o
 //   comprovante (verificação atômica via existsAfter).
 // ============================================================
@@ -34,22 +41,25 @@ service cloud.firestore {
       // Cada um lê o próprio perfil; moderador lê (e lista) todos
       allow read: if logado() && (request.auth.uid == uid || ehModerador());
 
-      // Criação: só o próprio, sempre como funcionário
+      // Criação: só o próprio, sempre como funcionário (PIX opcional aqui;
+      // o app pede a chave no primeiro acesso se faltar)
       allow create: if logado()
         && request.auth.uid == uid
-        && request.resource.data.keys().hasOnly(['nome', 'email', 'papel', 'criadoEm'])
+        && request.resource.data.keys().hasOnly(['nome', 'email', 'papel', 'criadoEm', 'pix'])
         && request.resource.data.papel == 'funcionario'
         && request.resource.data.email == request.auth.token.email
         && request.resource.data.nome is string
-        && request.resource.data.nome.size() > 0;
+        && request.resource.data.nome.size() > 0
+        && request.resource.data.get('pix', '') is string;
 
-      // Moderador muda papel/nome; o próprio usuário só muda o nome
+      // Moderador muda papel/nome; o próprio usuário muda o nome e a chave PIX
       allow update: if
         (ehModerador()
           && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['papel', 'nome'])
           && request.resource.data.papel in ['funcionario', 'moderador'])
         || (logado() && request.auth.uid == uid
-          && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['nome']));
+          && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['nome', 'pix'])
+          && request.resource.data.get('pix', '') is string);
 
       allow delete: if ehModerador();
     }
@@ -67,7 +77,8 @@ service cloud.firestore {
         && (resource.data.uid == request.auth.uid || ehModerador());
 
       // Criação pelo próprio funcionário: nasce pendente, com valor válido,
-      // justificativa obrigatória se Uber Comfort e comprovante no mesmo lote
+      // descrição obrigatória, justificativa obrigatória se Uber Comfort
+      // e comprovante no mesmo lote
       allow create: if logado()
         && request.resource.data.uid == request.auth.uid
         && request.resource.data.status == 'pendente'
@@ -76,6 +87,8 @@ service cloud.firestore {
         && request.resource.data.categoria in ['Alimentação', 'Uber', 'Combustível', 'Hospedagem', 'Outros']
         && request.resource.data.dataDespesa is string
         && request.resource.data.dataDespesa.size() == 10
+        && request.resource.data.descricao is string
+        && request.resource.data.descricao.size() > 0
         && (
           request.resource.data.get('subtipo', '') != 'Uber Comfort'
           || (request.resource.data.justificativa is string
@@ -84,7 +97,9 @@ service cloud.firestore {
         && existsAfter(/databases/$(database)/documents/comprovantes/$(id));
 
       // Moderação: só moderador, só em pendente, só os campos de moderação;
-      // negar exige observação preenchida
+      // negar exige observação; aprovar parcial (valor menor que o
+      // solicitado) também exige observação — a menos que seja exatamente
+      // o valor sugerido pelo desconto automático de alimentação
       allow update: if ehModerador()
         && resource.data.status == 'pendente'
         && request.resource.data.diff(resource.data).affectedKeys()
@@ -93,7 +108,13 @@ service cloud.firestore {
           (request.resource.data.status == 'aprovada'
             && request.resource.data.valorAprovado is number
             && request.resource.data.valorAprovado >= 0
-            && request.resource.data.valorAprovado <= resource.data.valor)
+            && request.resource.data.valorAprovado <= resource.data.valor
+            && (
+              request.resource.data.valorAprovado == resource.data.valor
+              || request.resource.data.valorAprovado == resource.data.get('valorSugerido', resource.data.valor)
+              || (request.resource.data.observacao is string
+                  && request.resource.data.observacao.size() > 0)
+            ))
           ||
           (request.resource.data.status == 'negada'
             && request.resource.data.observacao is string
