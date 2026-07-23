@@ -1053,10 +1053,10 @@
         ? '<div class="sol-obs-ok">✓ Aprovada' + (ehParcial(s) ? ' parcialmente' : '') +
           ': <b>' + fmtBRL(s.valorAprovado) + '</b>' +
           (ehParcial(s) ? ' <span class="mini">(solicitado ' + fmtBRL(s.valor) + ')</span>' : '') +
-          (s.moderadoPor ? ' · por ' + esc(s.moderadoPor) : '') +
+          (s.moderadoPor ? ' · por ' + esc(nomeModeradoPor(s.moderadoPor)) : '') +
           (s.observacao ? '<br>' + esc(s.observacao) : '') + '</div>' : '') +
       (s.status === 'negada'
-        ? '<div class="sol-obs"><b>Negada' + (s.moderadoPor ? ' por ' + esc(s.moderadoPor) : '') +
+        ? '<div class="sol-obs"><b>Negada' + (s.moderadoPor ? ' por ' + esc(nomeModeradoPor(s.moderadoPor)) : '') +
           ':</b> ' + esc(s.observacao) + '</div>' : '') +
       '<div class="sol-botoes">' +
       '<button class="btn" data-acao="ver" data-id="' + s.id + '">📄 Comprovante</button>' +
@@ -1078,6 +1078,122 @@
     if (acao === 'aprovar' && sol) abrirAprovar(sol);
     if (acao === 'negar' && sol) abrirNegar(sol);
   });
+
+  // ============================================================
+  // [M2] GANCHO RF-1 — a aprovação alimenta a fila de pagamento
+  // (coleção `pagamentos`) na MESMA transaction que grava a
+  // aprovação. Falha na fila = falha na aprovação (atômico).
+  // ============================================================
+
+  // [M2/P8] moderadoPor agora guarda o UID do moderador (trilha
+  // confiável nas rules). Docs ANTIGOS guardam o nome — se o valor
+  // não for uid de um usuário conhecido, exibe como está.
+  function nomeModeradoPor(v) {
+    if (!v) return '';
+    const u = usuarios.find((x) => x.id === v);
+    return (u && u.nome) || v;
+  }
+
+  function erroFila(codigo) {
+    const e = new Error(codigo);
+    e.codigo = codigo;
+    return e;
+  }
+  function msgErroFila(e) {
+    if (e && e.codigo === 'JA_MODERADA')
+      return 'Essa despesa já foi moderada — o painel atualiza sozinho.';
+    if (e && e.codigo === 'SEM_CADASTRO')
+      return 'Funcionário sem cadastro ativo — aprovação cancelada.';
+    if (e && e.codigo === 'LOTE_MISTO')
+      return 'Erro interno: despesas de funcionários diferentes na mesma aprovação.';
+    return msgErroFirebase(e);
+  }
+
+  // Item ABERTO (aguardando) da fila para o funcionário. A busca é
+  // FORA da transaction (o SDK web não faz query dentro de
+  // transaction) — a transaction re-lê o doc e revalida o status
+  // antes de agregar (edge §10: se virou 'enviado', abre item novo).
+  async function acharItemFilaAberto(uid) {
+    const q = await db.collection('pagamentos')
+      .where('tipo', '==', 'reembolso')
+      .where('uidFuncionario', '==', uid)
+      .where('status', '==', 'aguardando')
+      .limit(1).get();
+    return q.empty ? null : q.docs[0].ref;
+  }
+
+  // Aprova 1..N despesas do MESMO funcionário e alimenta a fila:
+  // agrega no item 'aguardando' existente ou cria um novo (§6).
+  // Regras duras:
+  // - transaction (nunca batch): re-lê solicitações, cadastro e item
+  //   da fila; corrida → retry automático do SDK;
+  // - pix lido FRESCO de usuarios/{uid} DENTRO da transaction —
+  //   nunca de cache; sem pix ⇒ chavePix null (aprovação prossegue);
+  // - item 'enviado'/'pago' NUNCA é alterado — abre item novo;
+  // - total aprovado R$ 0 → fila intocada (nada a pagar).
+  async function aprovarComFila(itensAprovar) {
+    const uidFav = itensAprovar[0].uid;
+    const refCandidata = await acharItemFilaAberto(uidFav);
+    await db.runTransaction(async (tx) => {
+      // ---- leituras (todas antes de qualquer escrita) ----
+      const solRefs = itensAprovar.map((it) => db.collection('solicitacoes').doc(it.id));
+      const solSnaps = [];
+      for (let i = 0; i < solRefs.length; i++) solSnaps.push(await tx.get(solRefs[i]));
+      solSnaps.forEach((s) => {
+        if (!s.exists || s.data().status !== 'pendente') throw erroFila('JA_MODERADA');
+        if (s.data().uid !== uidFav) throw erroFila('LOTE_MISTO');
+      });
+      const userSnap = await tx.get(db.collection('usuarios').doc(uidFav));
+      if (!userSnap.exists) throw erroFila('SEM_CADASTRO');
+      const pixFresco = userSnap.data().pix ? String(userSnap.data().pix) : null;
+      const nomeFresco = userSnap.data().nome || solSnaps[0].data().nome || '—';
+
+      let filaSnap = null;
+      if (refCandidata) filaSnap = await tx.get(refCandidata);
+      const dFila = filaSnap && filaSnap.exists ? filaSnap.data() : null;
+      const agregavel = !!(dFila && dFila.tipo === 'reembolso' &&
+        dFila.uidFuncionario === uidFav && dFila.status === 'aguardando');
+
+      const total = Math.round(itensAprovar.reduce((t, it) => t + it.valorAprovado, 0) * 100) / 100;
+      const ids = itensAprovar.map((it) => it.id);
+
+      // ---- escritas ----
+      let pagamentoId = null;
+      if (total > 0 && agregavel) {
+        pagamentoId = refCandidata.id;
+        tx.update(refCandidata, {
+          valor: Math.round((dFila.valor + total) * 100) / 100,
+          solicitacaoIds: FV.arrayUnion.apply(FV, ids),
+          chavePix: pixFresco
+        });
+      } else if (total > 0) {
+        const novoRef = db.collection('pagamentos').doc();
+        pagamentoId = novoRef.id;
+        tx.set(novoRef, {
+          tipo: 'reembolso',
+          status: 'aguardando',
+          valor: total,
+          uidFuncionario: uidFav,
+          nomeFavorecido: nomeFresco,
+          chavePix: pixFresco,
+          solicitacaoIds: ids,
+          criadoPor: perfil.uid,
+          criadoEm: FV.serverTimestamp()
+        });
+      }
+      itensAprovar.forEach((it, i) => {
+        const campos = {
+          status: 'aprovada',
+          valorAprovado: it.valorAprovado,
+          observacao: it.observacao,
+          moderadoPor: perfil.uid,           // [M2/P8] uid, não nome
+          moderadoEm: FV.serverTimestamp()
+        };
+        if (pagamentoId) campos.pagamentoId = pagamentoId;
+        tx.update(solRefs[i], campos);
+      });
+    });
+  }
 
   function abrirAprovar(sol) {
     const sugerido = sugeridoDe(sol);
@@ -1110,16 +1226,11 @@
         return;
       }
       try {
-        await db.collection('solicitacoes').doc(sol.id).update({
-          status: 'aprovada',
-          valorAprovado: v,
-          observacao: obs,
-          moderadoPor: perfil.nome,
-          moderadoEm: FV.serverTimestamp()
-        });
+        // [M2] aprovação + fila na MESMA transaction (RF-1)
+        await aprovarComFila([{ id: sol.id, uid: sol.uid, valorAprovado: v, observacao: obs }]);
         toast('Aprovada: ' + fmtBRL(v), 'ok');
         fecharModal();
-      } catch (e2) { toast(msgErroFirebase(e2), 'erro'); }
+      } catch (e2) { toast(msgErroFila(e2), 'erro'); }
     });
   }
 
@@ -1144,20 +1255,16 @@
     $('#mdCancelar').addEventListener('click', fecharModal);
     $('#mdConfirmar').addEventListener('click', async () => {
       try {
-        const batch = db.batch();
-        pend.forEach((s) => {
-          batch.update(db.collection('solicitacoes').doc(s.id), {
-            status: 'aprovada',
-            valorAprovado: sugeridoDe(s),
-            observacao: '',
-            moderadoPor: perfil.nome,
-            moderadoEm: FV.serverTimestamp()
-          });
-        });
-        await batch.commit();
+        // [M2] lote inteiro numa transaction ÚNICA (era batch):
+        // aprova as N despesas e alimenta a fila UMA vez — todas as
+        // despesas do lote são do mesmo funcionário, então agregam
+        // no MESMO item (uma transação evita contenção entre elas)
+        await aprovarComFila(pend.map((s) => ({
+          id: s.id, uid: s.uid, valorAprovado: sugeridoDe(s), observacao: ''
+        })));
         toast(pend.length + ' despesas aprovadas.', 'ok');
         fecharModal();
-      } catch (e2) { toast(msgErroFirebase(e2), 'erro'); }
+      } catch (e2) { toast(msgErroFila(e2), 'erro'); }
     });
   }
 
@@ -1181,7 +1288,7 @@
         await db.collection('solicitacoes').doc(sol.id).update({
           status: 'negada',
           observacao: obs,
-          moderadoPor: perfil.nome,
+          moderadoPor: perfil.uid,           // [M2/P8] uid, não nome
           moderadoEm: FV.serverTimestamp()
         });
         toast('Despesa negada.', 'ok');
