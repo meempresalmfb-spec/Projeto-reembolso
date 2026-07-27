@@ -78,6 +78,7 @@
   let todas = [];
   let usuarios = [];
   let filaAberta = new Set();    // [RM] ids dos itens de pagamento ainda 'aguardando'
+  let filaCarregada = false;     // [RM] a leitura da fila chegou a funcionar?
   let itens = [novoItem()];      // despesas da nova solicitação
   let unsubs = [];
   let cadastroEmAndamento = false;
@@ -158,21 +159,23 @@
 
   // [RM] Decisão já tomada — elegível a revisão.
   const jaModerada = (s) => s.status === 'aprovada' || s.status === 'negada';
-  // [RM] Enquanto o item da fila estiver 'aguardando', a decisão ainda
-  // pode ser revista. Despesa sem pagamentoId (nunca entrou na fila, ou
-  // doc anterior ao gancho M2) é sempre revisável. Item que saiu do
-  // 'aguardando' = PIX já criado na Conta Simples ⇒ trava.
-  // Fail-closed de propósito: se o listener da fila falhar, filaAberta
-  // fica vazia e nenhuma aprovação com pagamentoId é liberada.
-  const revisavel = (s) => !s.pagamentoId || filaAberta.has(s.pagamentoId);
+  // [RM] Trava do pagamento: só bloqueia quando o app TEM CERTEZA de que
+  // o item saiu do 'aguardando' (PIX já criado). Se a leitura da fila
+  // não carregou — coleção ausente, sem permissão, offline — o botão
+  // continua aparecendo e quem recusa é o servidor, com mensagem clara.
+  // [RM/fix 2026-07-27] Antes isto era fail-closed e escondia o botão
+  // sempre que a fila falhava; escondia a função pedida por causa de uma
+  // peça acessória. Segurança de verdade está nas rules, não em esconder.
+  const revisavel = (s) => !s.pagamentoId || !filaCarregada || filaAberta.has(s.pagamentoId);
   // [RM/B] Trava de autoria (arbitragem do Lucas, 2026-07-27): quem revê
-  // é quem decidiu. As rules abrem exceção para o papel 'admin' — este
-  // app ainda não conhece esse papel (ehMod() só reconhece 'moderador'),
-  // então aqui a checagem é só de autoria; quando o admin entrar no app
-  // de reembolso, basta somar o papel a esta linha.
-  // Doc antigo (pré-M2) guarda o NOME em moderadoPor, nunca um uid —
-  // cai no bloqueio e só admin resolve, pelo console ou pelo módulo novo.
-  const souAutor = (s) => !!perfil && s.moderadoPor === perfil.uid;
+  // é quem decidiu.
+  // [RM/fix 2026-07-27] Doc anterior ao gancho grava o NOME do moderador
+  // em moderadoPor, não o uid — não existe autor confiável ali, então
+  // qualquer moderador revê (senão a função ficava inútil justamente no
+  // histórico já existente). As rules aplicam a MESMA regra, checando se
+  // moderadoPor corresponde a um usuário real.
+  const autorConhecido = (s) => usuarios.some((u) => u.id === s.moderadoPor);
+  const souAutor = (s) => !!perfil && (s.moderadoPor === perfil.uid || !autorConhecido(s));
 
   function nomeDe(sol) {
     const u = usuarios.find((x) => x.id === sol.uid);
@@ -409,8 +412,13 @@
         .where('status', '==', 'aguardando')
         .onSnapshot((s) => {
           filaAberta = new Set(s.docs.map((d) => d.id));
+          filaCarregada = true;
           renderPainel();
-        }, () => { filaAberta = new Set(); renderPainel(); }));
+        }, () => {
+          // Falhou (coleção ausente / sem permissão): a trava do pagamento
+          // fica desligada e quem decide passa a ser o servidor.
+          filaAberta = new Set(); filaCarregada = false; renderPainel();
+        }));
     }
   }
 
@@ -1443,7 +1451,9 @@
       // confirmar, outro moderador pode ter revisado a mesma despesa.
       // (Espelha a trava das rules; a exceção de admin de lá não vale
       // aqui porque este app ainda não conhece o papel 'admin'.)
-      if (at.status !== 'pendente' && at.moderadoPor !== perfil.uid)
+      if (at.status !== 'pendente'
+          && at.moderadoPor !== perfil.uid
+          && usuarios.some((u) => u.id === at.moderadoPor))
         throw erroFila('NAO_E_AUTOR');
 
       const pagIdAtual = at.pagamentoId || null;
