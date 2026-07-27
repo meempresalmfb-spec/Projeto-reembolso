@@ -77,6 +77,7 @@
   let minhas = [];
   let todas = [];
   let usuarios = [];
+  let filaAberta = new Set();    // [RM] ids dos itens de pagamento ainda 'aguardando'
   let itens = [novoItem()];      // despesas da nova solicitação
   let unsubs = [];
   let cadastroEmAndamento = false;
@@ -104,6 +105,14 @@
     if (!iso || iso.length !== 10) return iso || '';
     const p = iso.split('-');
     return p[2] + '/' + p[1] + '/' + p[0];
+  }
+  // [RM] Timestamp do Firestore (ou Date) → "27/07/2026 14:32"
+  function fmtDataHora(ts) {
+    const d = ts && ts.toDate ? ts.toDate() : (ts instanceof Date ? ts : null);
+    if (!d) return '';
+    return String(d.getDate()).padStart(2, '0') + '/' +
+      String(d.getMonth() + 1).padStart(2, '0') + '/' + d.getFullYear() + ' ' +
+      String(d.getHours()).padStart(2, '0') + ':' + String(d.getMinutes()).padStart(2, '0');
   }
   function parseValor(str) {
     str = String(str == null ? '' : str).trim();
@@ -133,6 +142,7 @@
   function rotuloDe(s) {
     if (s.status === 'pendente') return 'Pendente';
     if (s.status === 'negada') return 'Negada';
+    if (s.status === 'cancelada') return 'Cancelada';
     return ehParcial(s) ? 'Aprovada parcial' : 'Aprovada';
   }
   const chipDe = (s) =>
@@ -144,6 +154,25 @@
     ((b.criadoEm && b.criadoEm.toMillis ? b.criadoEm.toMillis() : 0) -
      (a.criadoEm && a.criadoEm.toMillis ? a.criadoEm.toMillis() : 0));
   const ehMod = () => perfil && perfil.papel === 'moderador';
+  const cent = (n) => Math.round(n * 100) / 100;
+
+  // [RM] Decisão já tomada — elegível a revisão.
+  const jaModerada = (s) => s.status === 'aprovada' || s.status === 'negada';
+  // [RM] Enquanto o item da fila estiver 'aguardando', a decisão ainda
+  // pode ser revista. Despesa sem pagamentoId (nunca entrou na fila, ou
+  // doc anterior ao gancho M2) é sempre revisável. Item que saiu do
+  // 'aguardando' = PIX já criado na Conta Simples ⇒ trava.
+  // Fail-closed de propósito: se o listener da fila falhar, filaAberta
+  // fica vazia e nenhuma aprovação com pagamentoId é liberada.
+  const revisavel = (s) => !s.pagamentoId || filaAberta.has(s.pagamentoId);
+  // [RM/B] Trava de autoria (arbitragem do Lucas, 2026-07-27): quem revê
+  // é quem decidiu. As rules abrem exceção para o papel 'admin' — este
+  // app ainda não conhece esse papel (ehMod() só reconhece 'moderador'),
+  // então aqui a checagem é só de autoria; quando o admin entrar no app
+  // de reembolso, basta somar o papel a esta linha.
+  // Doc antigo (pré-M2) guarda o NOME em moderadoPor, nunca um uid —
+  // cai no bloqueio e só admin resolve, pelo console ou pelo módulo novo.
+  const souAutor = (s) => !!perfil && s.moderadoPor === perfil.uid;
 
   function nomeDe(sol) {
     const u = usuarios.find((x) => x.id === sol.uid);
@@ -369,6 +398,19 @@
         usuarios = docsToArr(s).sort((a, b) => (a.nome || '').localeCompare(b.nome || '', 'pt-BR'));
         preencherFiltroFuncionarios(); renderPainel(); renderEquipe();
       }, () => {}));
+
+      // [RM] Itens de reembolso ainda ABERTOS na fila de pagamento.
+      // Serve só para saber se uma aprovação ainda pode ser revista —
+      // o painel do moderador não mostra nenhum dado de pagamento.
+      // Falha (rules antigas / coleção inexistente) deixa o Set vazio:
+      // trava as revisões em vez de liberar (fail-closed).
+      unsubs.push(db.collection('pagamentos')
+        .where('tipo', '==', 'reembolso')
+        .where('status', '==', 'aguardando')
+        .onSnapshot((s) => {
+          filaAberta = new Set(s.docs.map((d) => d.id));
+          renderPainel();
+        }, () => { filaAberta = new Set(); renderPainel(); }));
     }
   }
 
@@ -692,7 +734,10 @@
       .where('categoria', '==', 'Alimentação')
       .where('dataDespesa', '==', dataDesp)
       .get();
-    const anteriores = snap.docs.map((d) => d.data()).filter((d) => d.status !== 'negada');
+    // [RM] 'cancelada' entra junto com 'negada': despesa cancelada não
+    // consome o limite diário de alimentação.
+    const anteriores = snap.docs.map((d) => d.data())
+      .filter((d) => d.status !== 'negada' && d.status !== 'cancelada');
     const efetivo = (d) => d.status === 'aprovada'
       ? (typeof d.valorAprovado === 'number' ? d.valorAprovado : d.valor)
       : (typeof d.valorSugerido === 'number' ? d.valorSugerido : d.valor);
@@ -895,6 +940,15 @@
         (s.observacao ? '<br>' + esc(s.observacao) : '') + '</div>';
     if (s.status === 'negada')
       extras += '<div class="sol-obs"><b>Motivo da negativa:</b> ' + esc(s.observacao || '—') + '</div>';
+    // [RM] Cancelada pelo moderador (substitui a exclusão física).
+    if (s.status === 'cancelada')
+      extras += '<div class="sol-obs"><b>Cancelada pelo moderador:</b> ' + esc(s.observacao || '—') + '</div>';
+    // [RM] Aviso de decisão revista — o funcionário precisa saber que o
+    // que ele leu antes mudou (a trilha completa fica no painel).
+    if (Array.isArray(s.historicoModeracao) && s.historicoModeracao.length)
+      extras += '<div class="sol-info mini">↻ Decisão revista ' +
+        (s.historicoModeracao.length > 1 ? s.historicoModeracao.length + ' vezes' : '1 vez') +
+        (s.moderadoEm && s.moderadoEm.toDate ? ' · última em ' + fmtDataHora(s.moderadoEm) : '') + '</div>';
     return '<div class="sol-item">' +
       '<div class="sol-topo">' + chipDe(s) + '<b>' + fmtBRL(s.valor) + '</b></div>' +
       '<div class="sol-info">' + esc(s.categoria) +
@@ -1058,13 +1112,47 @@
       (s.status === 'negada'
         ? '<div class="sol-obs"><b>Negada' + (s.moderadoPor ? ' por ' + esc(nomeModeradoPor(s.moderadoPor)) : '') +
           ':</b> ' + esc(s.observacao) + '</div>' : '') +
+      (s.status === 'cancelada'
+        ? '<div class="sol-obs"><b>Cancelada' + (s.moderadoPor ? ' por ' + esc(nomeModeradoPor(s.moderadoPor)) : '') +
+          ':</b> ' + esc(s.observacao || '—') + '</div>' : '') +
+      histModeracaoHTML(s) +
       '<div class="sol-botoes">' +
       '<button class="btn" data-acao="ver" data-id="' + s.id + '">📄 Comprovante</button>' +
       (s.status === 'pendente'
         ? '<button class="btn sucesso" data-acao="aprovar" data-id="' + s.id + '">✓ Aprovar</button>' +
-          '<button class="btn perigo" data-acao="negar" data-id="' + s.id + '">✕ Negar</button>'
+          '<button class="btn perigo" data-acao="negar" data-id="' + s.id + '">✕ Negar</button>' +
+          '<button class="btn" data-acao="cancelar" data-id="' + s.id + '">🚫 Cancelar</button>'
+        : '') +
+      // [RM] Decisão já tomada: rever ou cancelar. Duas travas, nesta
+      // ordem — o pagamento que já saiu vale mais que a autoria.
+      (jaModerada(s)
+        ? (!revisavel(s)
+          ? '<span class="sol-travada">🔒 Pagamento já enviado ao BPO — ajuste só por estorno na Conta Simples</span>'
+          : !souAutor(s)
+          ? '<span class="sol-travada">🔒 Quem decidiu foi ' + esc(nomeModeradoPor(s.moderadoPor)) +
+            ' — só essa pessoa (ou um admin) pode rever</span>'
+          : '<button class="btn" data-acao="rever" data-id="' + s.id + '">✏️ Rever decisão</button>' +
+            '<button class="btn" data-acao="cancelar" data-id="' + s.id + '">🚫 Cancelar</button>')
         : '') +
       '</div></div>';
+  }
+
+  // [RM] Trilha de decisões — só o painel do moderador mostra completa.
+  // Cada entrada é um snapshot da decisão ANTERIOR, empilhada no
+  // momento em que ela foi substituída.
+  function histModeracaoHTML(s) {
+    const h = Array.isArray(s.historicoModeracao) ? s.historicoModeracao : [];
+    if (!h.length) return '';
+    const rot = (d) => d.status === 'aprovada' ? 'Aprovada'
+      : d.status === 'negada' ? 'Negada'
+      : d.status === 'cancelada' ? 'Cancelada' : 'Pendente';
+    return '<details class="sol-hist"><summary>↻ Histórico de decisões (' + h.length + ')</summary>' +
+      h.map((d) => '<div class="sol-hist-item"><b>' + esc(rot(d)) + '</b>' +
+        (typeof d.valorAprovado === 'number' ? ' · ' + fmtBRL(d.valorAprovado) : '') +
+        ' · ' + esc(nomeModeradoPor(d.por)) +
+        (d.em ? ' · ' + fmtDataHora(d.em) : '') +
+        (d.observacao ? '<br><span class="mini">' + esc(d.observacao) + '</span>' : '') +
+        '</div>').join('') + '</details>';
   }
 
   $('#listaPainel').addEventListener('click', (e) => {
@@ -1077,6 +1165,8 @@
     if (acao === 'ver') verComprovante(btn.dataset.id);
     if (acao === 'aprovar' && sol) abrirAprovar(sol);
     if (acao === 'negar' && sol) abrirNegar(sol);
+    if (acao === 'rever' && sol) abrirRever(sol);       // [RM]
+    if (acao === 'cancelar' && sol) abrirCancelar(sol); // [RM]
   });
 
   // ============================================================
@@ -1106,6 +1196,18 @@
       return 'Funcionário sem cadastro ativo — aprovação cancelada.';
     if (e && e.codigo === 'LOTE_MISTO')
       return 'Erro interno: despesas de funcionários diferentes na mesma aprovação.';
+    // [RM] códigos da revisão de decisão
+    if (e && e.codigo === 'PAGAMENTO_ENVIADO')
+      return 'O pagamento dessa despesa já saiu para o BPO — não dá para revisar aqui. ' +
+        'A correção é por estorno na Conta Simples.';
+    if (e && e.codigo === 'JA_CANCELADA')
+      return 'Essa despesa já está cancelada.';
+    if (e && e.codigo === 'AINDA_PENDENTE')
+      return 'Essa despesa ainda está pendente — use Aprovar ou Negar.';
+    if (e && e.codigo === 'SUMIU')
+      return 'Despesa não encontrada — o painel atualiza sozinho.';
+    if (e && e.codigo === 'NAO_E_AUTOR')
+      return 'Quem tomou essa decisão foi outro moderador — só essa pessoa (ou um admin) pode revê-la.';
     return msgErroFirebase(e);
   }
 
@@ -1297,6 +1399,255 @@
     });
   }
 
+  // ============================================================
+  // [RM] REVISÃO DE DECISÃO JÁ TOMADA
+  // Mesma disciplina do gancho RF-1: transaction única, TODAS as
+  // leituras antes de qualquer escrita, item da fila só é tocado
+  // enquanto 'aguardando'. A decisão anterior é empilhada em
+  // historicoModeracao — nenhuma decisão se perde.
+  // ============================================================
+
+  // Fotografia da decisão vigente, para empilhar no histórico.
+  // O timestamp reaproveita o moderadoEm do servidor da decisão que
+  // está saindo; serverTimestamp() NÃO funciona dentro de elemento de
+  // array, então o fallback é o relógio do cliente.
+  function snapshotDecisao(d) {
+    const e = {
+      status: d.status,
+      observacao: d.observacao || '',
+      por: d.moderadoPor || '',
+      em: d.moderadoEm || firebase.firestore.Timestamp.now()
+    };
+    if (typeof d.valorAprovado === 'number') e.valorAprovado = d.valorAprovado;
+    return e;
+  }
+
+  // dec: { status: 'aprovada'|'negada'|'cancelada', valorAprovado, observacao }
+  async function remoderar(sol, dec) {
+    const entraNaFila = dec.status === 'aprovada' && dec.valorAprovado > 0;
+    const jaTemItemAberto = !!sol.pagamentoId && filaAberta.has(sol.pagamentoId);
+    // Só procura item de DESTINO quando a despesa não está num item
+    // aberto — se está, o ajuste é no próprio item (não migra de item).
+    const refCandidata = (entraNaFila && !jaTemItemAberto)
+      ? await acharItemFilaAberto(sol.uid) : null;
+
+    await db.runTransaction(async (tx) => {
+      // ---- leituras (todas antes de qualquer escrita) ----
+      const solRef = db.collection('solicitacoes').doc(sol.id);
+      const solSnap = await tx.get(solRef);
+      if (!solSnap.exists) throw erroFila('SUMIU');
+      const at = solSnap.data();
+      if (at.status === 'cancelada') throw erroFila('JA_CANCELADA');
+      if (at.status === 'pendente' && dec.status !== 'cancelada') throw erroFila('AINDA_PENDENTE');
+      // [RM/B] Autoria revalidada no dado FRESCO: entre abrir o modal e
+      // confirmar, outro moderador pode ter revisado a mesma despesa.
+      // (Espelha a trava das rules; a exceção de admin de lá não vale
+      // aqui porque este app ainda não conhece o papel 'admin'.)
+      if (at.status !== 'pendente' && at.moderadoPor !== perfil.uid)
+        throw erroFila('NAO_E_AUTOR');
+
+      const pagIdAtual = at.pagamentoId || null;
+      let velhoRef = null, velhoSnap = null;
+      if (pagIdAtual) {
+        velhoRef = db.collection('pagamentos').doc(pagIdAtual);
+        velhoSnap = await tx.get(velhoRef);
+      }
+      const velho = velhoSnap && velhoSnap.exists ? velhoSnap.data() : null;
+      // Trava dura revalidada no servidor: item fora de 'aguardando'
+      // significa PIX já criado na Conta Simples — nada se mexe.
+      // ('cancelado' passa: o BPO já tirou o item, a despesa ficou solta.)
+      if (velho && velho.status !== 'aguardando' && velho.status !== 'cancelado')
+        throw erroFila('PAGAMENTO_ENVIADO');
+      const velhoAberto = !!(velho && velho.status === 'aguardando');
+
+      let destinoSnap = null;
+      if (refCandidata) destinoSnap = await tx.get(refCandidata);
+      // Cadastro lido FRESCO sempre que a fila for tocada: o snapshot
+      // chavePix fica amarrado ao cadastro vigente (mesma amarra do
+      // gancho RF-1 / rev. 4 das rules).
+      let userSnap = null;
+      if (velhoAberto || entraNaFila) {
+        userSnap = await tx.get(db.collection('usuarios').doc(sol.uid));
+        if (!userSnap.exists) throw erroFila('SEM_CADASTRO');
+      }
+      // ---- fim das leituras ----
+      const pixFresco = userSnap && userSnap.data().pix ? String(userSnap.data().pix) : null;
+
+      const v0 = at.status === 'aprovada' && typeof at.valorAprovado === 'number'
+        ? at.valorAprovado : 0;
+      const v1 = entraNaFila ? dec.valorAprovado : 0;
+      let pagamentoIdFinal = null;
+
+      if (velhoAberto && entraNaFila) {
+        // (a) segue aprovada e já está num item aberto → só o delta
+        const novoValor = cent(velho.valor - v0 + v1);
+        if (novoValor <= 0) {
+          tx.update(velhoRef, {
+            status: 'cancelado',
+            canceladoPor: perfil.uid,
+            motivoCancelamento: 'Aprovação revista pelo moderador — item sem valor a pagar'
+          });
+        } else {
+          pagamentoIdFinal = pagIdAtual;
+          tx.update(velhoRef, { valor: novoValor, chavePix: pixFresco });
+        }
+      } else if (velhoAberto) {
+        // (b) sai da fila (virou negada/cancelada, ou valor foi a zero)
+        const restante = (velho.solicitacaoIds || []).filter((x) => x !== sol.id);
+        const novoValor = cent(velho.valor - v0);
+        if (!restante.length || novoValor <= 0) {
+          tx.update(velhoRef, {
+            status: 'cancelado',
+            canceladoPor: perfil.uid,
+            motivoCancelamento: 'Aprovação revista pelo moderador — item sem despesas a pagar'
+          });
+        } else {
+          tx.update(velhoRef, {
+            valor: novoValor, solicitacaoIds: restante, chavePix: pixFresco
+          });
+        }
+      }
+
+      if (entraNaFila && !velhoAberto) {
+        // (c) reentrada na fila: agrega no item aberto ou cria um novo
+        const dDest = destinoSnap && destinoSnap.exists ? destinoSnap.data() : null;
+        const agregavel = !!(dDest && dDest.tipo === 'reembolso' &&
+          dDest.uidFuncionario === sol.uid && dDest.status === 'aguardando');
+        if (agregavel) {
+          pagamentoIdFinal = refCandidata.id;
+          tx.update(refCandidata, {
+            valor: cent(dDest.valor + v1),
+            solicitacaoIds: FV.arrayUnion(sol.id),
+            chavePix: pixFresco
+          });
+        } else {
+          const novoRef = db.collection('pagamentos').doc();
+          pagamentoIdFinal = novoRef.id;
+          tx.set(novoRef, {
+            tipo: 'reembolso',
+            status: 'aguardando',
+            valor: v1,
+            uidFuncionario: sol.uid,
+            nomeFavorecido: userSnap.data().nome || at.nome || '—',
+            chavePix: pixFresco,
+            solicitacaoIds: [sol.id],
+            criadoPor: perfil.uid,
+            criadoEm: FV.serverTimestamp()
+          });
+        }
+      }
+
+      // ---- a despesa ----
+      const campos = {
+        status: dec.status,
+        valorAprovado: dec.status === 'aprovada' ? dec.valorAprovado : 0,
+        observacao: dec.observacao || '',
+        moderadoPor: perfil.uid,
+        moderadoEm: FV.serverTimestamp(),
+        // append explícito (não arrayUnion): dentro da transaction o
+        // valor lido é o corrente, e duas decisões idênticas não podem
+        // colapsar num elemento só
+        historicoModeracao: (at.historicoModeracao || []).concat([snapshotDecisao(at)]),
+        pagamentoId: pagamentoIdFinal || FV.delete()
+      };
+      tx.update(solRef, campos);
+    });
+  }
+
+  function abrirRever(sol) {
+    const sugerido = sugeridoDe(sol);
+    const vAtual = sol.status === 'aprovada' && typeof sol.valorAprovado === 'number'
+      ? sol.valorAprovado : sugerido;
+    abrirModal(
+      '<h3>Rever decisão</h3>' +
+      '<p><b>' + esc(nomeDe(sol)) + '</b> — ' + esc(sol.categoria) +
+      (sol.subtipo ? ' (' + esc(sol.subtipo) + ')' : '') + ' — ' + fmtData(sol.dataDespesa) + '</p>' +
+      (sol.descricao ? '<p class="mini">' + esc(sol.descricao) + '</p>' : '') +
+      '<p>Valor solicitado: <b>' + fmtBRL(sol.valor) + '</b></p>' +
+      '<div class="aviso">Decisão atual: <b>' + esc(rotuloDe(sol)) + '</b>' +
+      (sol.status === 'aprovada' ? ' — ' + fmtBRL(sol.valorAprovado) : '') +
+      (sol.observacao ? '<br>' + esc(sol.observacao) : '') +
+      '<br><span class="mini">Ela vai para o histórico e o funcionário verá que a decisão foi revista.</span></div>' +
+      '<label>Nova decisão' +
+      '<select id="mdNovoStatus">' +
+      '<option value="aprovada"' + (sol.status === 'aprovada' ? ' selected' : '') + '>Aprovar</option>' +
+      '<option value="negada"' + (sol.status === 'negada' ? ' selected' : '') + '>Negar</option>' +
+      '</select></label>' +
+      '<label id="mdLinhaValor">Valor a reembolsar (R$)' +
+      '<input type="text" id="mdValorRever" inputmode="decimal" value="' + fmtNum(vAtual) + '"></label>' +
+      '<label>Motivo da revisão <b class="obrig">(obrigatório — o funcionário vai ler)</b>' +
+      '<textarea id="mdObsRever" rows="3" placeholder="Ex.: comprovante reenviado legível — aprovação corrigida…"></textarea></label>' +
+      '<div class="linha-botoes">' +
+      '<button class="btn" id="mdCancelar">Fechar</button>' +
+      '<button class="btn sucesso" id="mdConfirmar">✓ Salvar revisão</button></div>');
+    const selStatus = $('#mdNovoStatus');
+    const sincronizar = () => { $('#mdLinhaValor').hidden = selStatus.value !== 'aprovada'; };
+    selStatus.addEventListener('change', sincronizar);
+    sincronizar();
+    $('#mdCancelar').addEventListener('click', fecharModal);
+    $('#mdConfirmar').addEventListener('click', async () => {
+      const novo = selStatus.value;
+      const obs = $('#mdObsRever').value.trim();
+      // Motivo SEMPRE obrigatório: decisão já comunicada ao funcionário
+      // só muda com explicação — inclusive quando o valor sobe.
+      if (!obs) {
+        toast('Escreva o motivo da revisão — é obrigatório.', 'erro');
+        $('#mdObsRever').focus();
+        return;
+      }
+      let v = 0;
+      if (novo === 'aprovada') {
+        v = parseValor($('#mdValorRever').value);
+        if (!(v >= 0)) { toast('Valor inválido.', 'erro'); return; }
+        if (v > sol.valor) {
+          toast('O valor aprovado não pode ser maior que o solicitado (' + fmtBRL(sol.valor) + ').', 'erro');
+          return;
+        }
+      }
+      const btn = $('#mdConfirmar');
+      btn.disabled = true;
+      try {
+        await remoderar(sol, { status: novo, valorAprovado: v, observacao: obs });
+        toast(novo === 'aprovada' ? 'Revisada — aprovada: ' + fmtBRL(v) : 'Revisada — negada.', 'ok');
+        fecharModal();
+      } catch (e2) { btn.disabled = false; toast(msgErroFila(e2), 'erro'); }
+    });
+  }
+
+  function abrirCancelar(sol) {
+    const naFila = sol.status === 'aprovada' && !!sol.pagamentoId;
+    abrirModal(
+      '<h3>Cancelar despesa</h3>' +
+      '<p><b>' + esc(nomeDe(sol)) + '</b> — ' + esc(sol.categoria) + ' — ' +
+      fmtBRL(sol.valor) + ' — ' + fmtData(sol.dataDespesa) + '</p>' +
+      (sol.descricao ? '<p class="mini">' + esc(sol.descricao) + '</p>' : '') +
+      '<div class="aviso">A despesa sai do totalizador e da fila de pagamento, mas <b>continua guardada</b> ' +
+      'com o comprovante para auditoria. Só esta despesa é afetada.' +
+      (naFila ? '<br>O valor também é retirado do item de pagamento em aberto.' : '') +
+      '<br><span class="mini">Cancelamento não tem volta — se for engano, o funcionário reenvia a despesa.</span></div>' +
+      '<label>Motivo do cancelamento <b class="obrig">(obrigatório — o funcionário vai ler)</b>' +
+      '<textarea id="mdObsCancelar" rows="3" placeholder="Ex.: lançamento duplicado — enviado duas vezes…"></textarea></label>' +
+      '<div class="linha-botoes">' +
+      '<button class="btn" id="mdCancelar">Fechar</button>' +
+      '<button class="btn perigo" id="mdConfirmar">🚫 Confirmar cancelamento</button></div>');
+    $('#mdCancelar').addEventListener('click', fecharModal);
+    $('#mdConfirmar').addEventListener('click', async () => {
+      const obs = $('#mdObsCancelar').value.trim();
+      if (!obs) {
+        toast('Escreva o motivo do cancelamento — é obrigatório.', 'erro');
+        $('#mdObsCancelar').focus();
+        return;
+      }
+      const btn = $('#mdConfirmar');
+      btn.disabled = true;
+      try {
+        await remoderar(sol, { status: 'cancelada', valorAprovado: 0, observacao: obs });
+        toast('Despesa cancelada.', 'ok');
+        fecharModal();
+      } catch (e2) { btn.disabled = false; toast(msgErroFila(e2), 'erro'); }
+    });
+  }
+
   function renderTotalizador() {
     const func = $('#fltFuncionario').value;
     const arr = todas
@@ -1306,7 +1657,8 @@
     const porFunc = {};
     arr.forEach((s) => {
       const g = porFunc[s.uid] || (porFunc[s.uid] = {
-        nome: nomeDe(s), pix: pixDe(s.uid), pendQtd: 0, pendVal: 0, aprQtd: 0, aprVal: 0, negQtd: 0
+        nome: nomeDe(s), pix: pixDe(s.uid), pendQtd: 0, pendVal: 0, aprQtd: 0, aprVal: 0,
+        negQtd: 0, cancQtd: 0
       });
       if (s.status === 'pendente') { g.pendQtd++; g.pendVal += s.valor || 0; }
       if (s.status === 'aprovada') {
@@ -1314,6 +1666,9 @@
         g.aprVal += typeof s.valorAprovado === 'number' ? s.valorAprovado : (s.valor || 0);
       }
       if (s.status === 'negada') g.negQtd++;
+      // [RM] cancelada não soma em lugar nenhum — só é contada, para
+      // não sumir do painel sem deixar rastro
+      if (s.status === 'cancelada') g.cancQtd++;
     });
 
     const grupos = Object.values(porFunc).sort((a, b) => a.nome.localeCompare(b.nome, 'pt-BR'));
@@ -1324,12 +1679,14 @@
     }
     const tot = grupos.reduce((t, g) => ({
       pendQtd: t.pendQtd + g.pendQtd, pendVal: t.pendVal + g.pendVal,
-      aprQtd: t.aprQtd + g.aprQtd, aprVal: t.aprVal + g.aprVal, negQtd: t.negQtd + g.negQtd
-    }), { pendQtd: 0, pendVal: 0, aprQtd: 0, aprVal: 0, negQtd: 0 });
+      aprQtd: t.aprQtd + g.aprQtd, aprVal: t.aprVal + g.aprVal, negQtd: t.negQtd + g.negQtd,
+      cancQtd: t.cancQtd + g.cancQtd
+    }), { pendQtd: 0, pendVal: 0, aprQtd: 0, aprVal: 0, negQtd: 0, cancQtd: 0 });
 
     el.innerHTML = '<table><thead><tr>' +
       '<th>Funcionário</th><th>PIX</th><th class="num">Pend.</th><th class="num">R$ pendente</th>' +
       '<th class="num">Aprov.</th><th class="num">R$ a pagar</th><th class="num">Neg.</th>' +
+      '<th class="num">Canc.</th>' +
       '</tr></thead><tbody>' +
       grupos.map((g) =>
         '<tr><td>' + esc(g.nome) + '</td>' +
@@ -1340,13 +1697,15 @@
         '<td class="num">' + fmtBRL(g.pendVal) + '</td>' +
         '<td class="num">' + g.aprQtd + '</td>' +
         '<td class="num">' + fmtBRL(g.aprVal) + '</td>' +
-        '<td class="num">' + g.negQtd + '</td></tr>').join('') +
+        '<td class="num">' + g.negQtd + '</td>' +
+        '<td class="num">' + g.cancQtd + '</td></tr>').join('') +
       '<tr class="total-geral"><td>Total</td><td></td>' +
       '<td class="num">' + tot.pendQtd + '</td>' +
       '<td class="num">' + fmtBRL(tot.pendVal) + '</td>' +
       '<td class="num">' + tot.aprQtd + '</td>' +
       '<td class="num">' + fmtBRL(tot.aprVal) + '</td>' +
-      '<td class="num">' + tot.negQtd + '</td></tr>' +
+      '<td class="num">' + tot.negQtd + '</td>' +
+      '<td class="num">' + tot.cancQtd + '</td></tr>' +
       '</tbody></table>';
   }
 

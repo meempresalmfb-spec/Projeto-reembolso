@@ -366,6 +366,37 @@ select option { background: var(--bordeaux-deep); color: var(--cream); }
 .chip-aprovada { background: var(--aprov-bg); color: var(--aprov-tx); border: 1px solid rgba(64, 160, 90, .3); }
 .chip-negada { background: var(--neg-bg); color: var(--neg-tx); border: 1px solid rgba(230, 57, 70, .3); }
 .chip-parcial { background: rgba(230, 150, 57, .16); color: #F2C08F; border: 1px solid rgba(230, 150, 57, .38); }
+/* [RM] Cancelada: neutra de propósito — não é negativa nem aprovação */
+.chip-cancelada { background: rgba(245, 237, 224, .1); color: var(--texto-suave); border: 1px solid rgba(245, 237, 224, .2); }
+
+/* ===== [RM] Revisão de decisão ===== */
+.sol-hist {
+  margin: 8px 0 2px;
+  font-size: .84rem;
+  border-left: 2px solid rgba(201, 169, 97, .28);
+  padding-left: 10px;
+}
+.sol-hist summary {
+  cursor: pointer;
+  color: var(--texto-suave);
+  padding: 2px 0;
+}
+.sol-hist-item {
+  padding: 6px 0;
+  border-top: 1px solid var(--borda);
+  line-height: 1.45;
+}
+.sol-hist-item:first-of-type { border-top: 0; }
+.sol-travada {
+  display: inline-block;
+  font-size: .82rem;
+  color: var(--texto-suave);
+  background: rgba(245, 237, 224, .06);
+  border: 1px solid var(--borda);
+  border-radius: 8px;
+  padding: 7px 12px;
+  line-height: 1.35;
+}
 
 /* ===== Itens da nova solicitação (várias despesas por envio) ===== */
 .item-despesa {
